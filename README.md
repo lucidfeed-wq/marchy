@@ -1,100 +1,120 @@
-# omarchy-mac
+# Marchy
 
-**[Omarchy](https://omarchy.org)'s desktop, rebuilt natively for macOS.** Hold Caps Lock as
-Super, tile windows the Hyprland way, use Omarchy's keybindings, its bar, menu, themes and
-pickers, and convert Omarchy shell plugins (including the 6,900+ in the
-[Omarchy plugin marketplace](https://github.com/omacom/omarchy-plugin-marketplace)) into
-native Mac ports automatically.
+**[Omarchy](https://omarchy.org)'s keyboard-driven desktop, rebuilt natively for macOS, as a Mac app.**
+Hold Caps Lock as Super, tile windows the Hyprland way, use Omarchy's keybindings, bar, menu,
+themes and pickers, and convert Omarchy plugins (including the 6,900+ in the
+[Omarchy plugin marketplace](https://github.com/omacom/omarchy-plugin-marketplace)) into native
+Mac versions with the AI account you already have.
 
+> Unofficial. Not affiliated with Omarchy, 37signals or Basecamp.
 > Targets Omarchy **4.5 "Quattro RS"** · Apple Silicon · macOS 26+
-
-## What you get
-
-| Omarchy (Linux) | omarchy-mac |
-|---|---|
-| Super key | **Caps Lock** held = Super (Karabiner-Elements), tap = Escape. Real held modifiers, so Super+drag works and shortcuts **keep working during macOS Secure Input** (password fields, e-signing). |
-| Hyprland dwindle tiling, workspaces 1–9, scrolling layout | [OmniWM](https://omniwm.app) (dwindle + niri-style scrolling), instant workspaces, gaps 5/10, accent border |
-| Omarchy keybindings (`Super+Return`, `Super+W`, `Super+1..9`, `Super+Shift+arrows`, `Super+Ctrl+T`, …) | 150+ bindings from **one file**, `bindings.toml`, generated into Karabiner, OmniWM and Hammerspoon (`omarchy-keys`) |
-| Omarchy bar | OmniShell bar: logo, workspaces, clock, **menu-bar tray mirrored into the bar**, interactive Wi-Fi and Bluetooth panels |
-| `Super+Space` menu, `Super+K` keybindings | Omarchy menu with type-to-search (Hammerspoon chooser), searchable keybinding list |
-| Theme picker / background picker | Image-grid pickers; one switch restyles Ghostty, Neovim, btop, the bar, borders, wallpaper and light/dark mode (all 23+ official Omarchy themes) |
-| Super+drag move/resize, Super+scroll | Same |
-| Omarchy shell plugins | **`omarchy-port`**: converts plugins to native ports (see below) |
 
 ## Install
 
 ```sh
-git clone https://github.com/<you>/omarchy-mac ~/omarchy-mac
-~/omarchy-mac/bootstrap.sh            # --dry-run to preview
+brew install --cask lucidfeed-wq/marchy/marchy
 ```
 
-`bootstrap.sh` installs the stack with Homebrew, fetches Omarchy's themes, backs up your
-current config, installs everything, then lists the macOS permissions to approve.
-Afterwards: `omarchy-doctor --static` (health check) and `omarchy-doctor --interactive`
-(guided test of your real keys, including a forced Secure Input pass).
+or download `Marchy-<version>.dmg` from [Releases](../../releases) and drag Marchy to Applications.
+Open Marchy and press **Set Up** on the Home screen: it installs the stack with Homebrew, fetches
+Omarchy's themes, backs up your current config and installs the Omarchy layer. Then approve the
+macOS permissions it lists (each has an **Open** button).
 
-Undo: `~/omarchy-mac/rollback.sh` restores the most recent backup.
+> Marchy is not notarized yet. The first time, macOS may say it can't be opened: go to
+> System Settings > Privacy & Security and click **Open Anyway**.
+
+## The app
+
+| Screen | What it does |
+|---|---|
+| **Home** | Set up / Update / Undo, component status, permission shortcuts, health check |
+| **Plugins** | Ready-made ports (install with one click), the Omarchy marketplace, any GitHub repo, and the plugins you converted |
+| **AI** | Connect the AI that converts plugins (below) |
+| **Themes** | All official Omarchy themes; one click restyles everything |
+| **Shortcuts** | Every keybinding, searchable; edit `bindings.toml` and apply |
+
+A menu-bar icon gives quick access to themes and reloading.
+
+### Bring your own AI
+
+Converting a plugin means rewriting Linux (Quickshell/QML) code as a Mac bar widget and backend,
+so Marchy uses an AI for it. Marchy has no account or server of its own; conversions run on
+**yours**, one of three ways:
+
+| How | Providers |
+|---|---|
+| **Local CLI** (your subscription) | Claude Code (Claude account), Codex (ChatGPT account), Grok CLI (xAI/X account). Marchy's **Sign In** opens the CLI's own login. |
+| **Linked account** | OpenRouter: **Sign in with OpenRouter** (OAuth), and Marchy receives a key for your account. |
+| **API key** | Anthropic, OpenAI, xAI, OpenRouter, Google Gemini, or any OpenAI-compatible server. Keys live in the macOS Keychain. |
+| **On this Mac** | Ollama (no account; needs a large model for good results). |
+
+Agent CLIs run in a sandbox folder with no MCP servers and may only read/write that folder and
+run `luajit`. API models get no tools at all: they return files as text, which Marchy checks
+(Lua compile, contract, privacy lint, widget load) and sends back for fixes, up to two rounds.
+
+The ready-made ports under **Plugins > Included** need no AI.
+
+## What you get
+
+| Omarchy (Linux) | Marchy |
+|---|---|
+| Super key | **Caps Lock** held = Super (Karabiner-Elements), tap = Escape. Real held modifiers, so Super+drag works and shortcuts **keep working during macOS Secure Input** (password fields, e-signing). |
+| Hyprland tiling, workspaces 1–9, scrolling layout | [OmniWM](https://omniwm.app) (dwindle + niri-style scrolling), instant workspaces, gaps, accent border |
+| Omarchy keybindings | 150+ bindings from **one file**, `bindings.toml`, generated into Karabiner, OmniWM and Hammerspoon |
+| Omarchy bar | OmniShell bar: logo, workspaces, clock, weather, media, menu-bar tray mirrored into the bar, interactive Wi-Fi/Bluetooth/audio panels |
+| `Super+Space` menu, `Super+K` keybindings | Omarchy menu with type-to-search; searchable keybinding list |
+| Theme and background pickers | Image-grid pickers; one switch restyles Ghostty, Neovim, btop, the bar, borders, wallpaper and light/dark mode |
+| Omarchy shell plugins | 20 ready-made ports + the converter for any other |
+
+## Command line
+
+Everything the app does is also a command (installed in `~/.local/bin`):
+
+```sh
+omarchy-doctor --static              # health check (--interactive: guided key test)
+omarchy-theme set tokyo-night
+omarchy-keys install                 # regenerate shortcuts after editing bindings.toml
+
+omarchy-port providers               # AI providers and their sign-in status
+omarchy-port provider set claude-code      # or: codex, grok, anthropic, openai, xai, openrouter, gemini, ollama
+omarchy-port provider key anthropic        # store an API key in the Keychain (reads stdin)
+omarchy-port market weather          # search the marketplace (security flags shown)
+omarchy-port add carl.weather        # fetch a listed plugin at its validated commit (or owner/repo, URL)
+omarchy-port analyze && omarchy-port generate <port id> && omarchy-port validate <port id>
+omarchy-port install <port id> --bar
+```
+
+Developers: clone this repo and run `./bootstrap.sh` (`--dry-run` to preview); Marchy.app notices
+a git checkout linked at `~/.config/omarchy-mac/build` and runs setup from it.
+`scripts/build-app.sh` builds the app and DMG (Command Line Tools are enough); pushing a `v*` tag
+builds a release on GitHub Actions.
 
 ## How it fits together
 
 ```
 Caps Lock ──► Karabiner-Elements ──► held Ctrl+Opt+Cmd ("Super")
-                     │                    │
-                     │                    ├─► OmniWM native hotkeys (window/workspace actions, Carbon)
-                     │                    └─► Hammerspoon hs.hotkey (apps, menu, pickers, screenshots)
-                     └─► Super+Ctrl / Super+Alt layers, Citrix-safe rules ─► shell_command
-                                                     (omarchy-wm / hammerspoon://omarchy?a=…)
+                     │                    ├─► OmniWM native hotkeys (window/workspace actions)
+                     │                    └─► Hammerspoon hs.hotkey (apps, menu, pickers)
+                     └─► Super+Ctrl / Super+Alt layers, remote-desktop-safe rules ─► shell_command
 OmniShell bar widgets ◄── omniwmctl shell set <json> ── Hammerspoon backends (tray, Wi-Fi, BT, ports)
 OmniShell widget clicks ──► hammerspoon://omarchy?a=<action> ──► Hammerspoon
+Marchy.app ──► bootstrap.sh / deploy.sh / omarchy-port / omarchy-theme / omarchy-doctor
 ```
 
 Nothing reads the keyboard through event taps (they go blind under Secure Input and can leave a
 modifier stuck). Bindings are Carbon hotkeys or Karabiner rules.
 
-| Path | What |
-|---|---|
-| `omarchy-mac/bindings.toml` | every shortcut (edit, then `omarchy-keys install`) |
-| `omarchy-mac/bin/` | `omarchy-keys` (generator), `omarchy-theme`, `omarchy-wm`, `omarchy-omniwm-set`, `omarchy-doctor`, `omarchy-port` |
-| `hammerspoon/` | menu, launchers, pickers, tray, Wi-Fi/Bluetooth backend, layout guard, ports loader |
-| `omniwm-shell/` | bar layout + Omarchy widgets |
-| `omarchy-mac/port/` | the converter's contract and Linux → macOS capability map |
-| `deploy.sh` / `rollback.sh` | install with backups / restore |
-
-## Converting Omarchy plugins: `omarchy-port`
-
-Omarchy 4.5's shell is a set of Quickshell (QML) plugins, which only run on Linux. `omarchy-port`
-reads a plugin's source, maps each Linux service it uses to a macOS equivalent
-(`capabilities.toml`), and has a headless Claude agent write a native port (an OmniShell bar
-widget plus a Hammerspoon backend) in an isolated sandbox. It then validates the port
-(compiles in Hammerspoon, loads in OmniWM, actions exist and are namespaced, privacy lint)
-before you install it.
-
-```sh
-omarchy-port sync                    # fetch Omarchy's source (v4.5.0)
-omarchy-port analyze                 # 32 plugins: native / portable / partial / skip / not portable
-omarchy-port generate osd audio      # or --all
-omarchy-port validate --all
-omarchy-port install osd --bar
-
-omarchy-port market weather          # search the Omarchy plugin marketplace (security flags shown)
-omarchy-port add carl.weather        # fetch a listed plugin at its validated commit
-omarchy-port add owner/repo          # or any GitHub repo with an Omarchy manifest.json
-```
-
-Third-party plugin code is only *read* by the converter and treated as untrusted data, never run.
-Every port is validated, and nothing is installed without `omarchy-port install`. Generation needs
-the [Claude Code](https://claude.com/claude-code) CLI.
-
 ## Safety design
 
-- **Secure Input:** Super chords include Ctrl/Cmd and are Carbon hotkeys or Karabiner rules, so
-  they survive password fields. `omarchy-doctor --secure-input` proves it.
-- **No Full Disk Access, no Screen Recording, no SIP changes.** The menu-bar tray uses
-  Accessibility only.
-- **Remote desktops (Citrix Viewer):** Caps Lock sends no stray modifiers into the session, and
-  every binding is served by Karabiner there.
-- **Privacy:** notification, clipboard and window-title content is never logged; the tray
-  mirror skips OmniWM's own item because it shows window titles.
+- **Secure Input:** Super chords are Carbon hotkeys or Karabiner rules, so they survive password
+  fields. `omarchy-doctor --secure-input` proves it.
+- **No Full Disk Access, no Screen Recording, no SIP changes.** The menu-bar tray uses Accessibility only.
+- **Remote desktops (Citrix Viewer):** Caps Lock sends no stray modifiers into the session.
+- **Privacy:** notification, clipboard and window-title content is never logged.
+- **Third-party plugins** are only *read* by the converter, as untrusted data, never run. Only the
+  port your AI writes runs, after it passes the checks and you install it.
+- **Updates keep your edits:** an edited `bindings.toml` is kept (the new default is saved as
+  `bindings.toml.new`), and every update backs up your config first (Home > Undo Last Update).
 
 ## Limits (macOS, not this project)
 
@@ -105,6 +125,8 @@ the password prompt, and moving native menus under the tray icon you clicked.
 
 [Omarchy](https://github.com/basecamp/omarchy) (MIT): design, keybindings and themes; themes are
 fetched from its release at install time. [OmniWM](https://github.com/OmniNull/OmniWM) (GPL-2.0):
-tiling and the bar runtime; installed via Homebrew and not vendored here.
+tiling and the bar runtime; installed via Homebrew, not bundled.
 [Karabiner-Elements](https://karabiner-elements.pqrs.org), [Hammerspoon](https://www.hammerspoon.org),
 [Ghostty](https://ghostty.org), [blueutil](https://github.com/toy/blueutil).
+
+MIT licensed.

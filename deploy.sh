@@ -282,7 +282,18 @@ done
 # ----------------------------------------------------------------------------- 1 omarchy-mac files
 step 1 "bindings.toml, bin/*, templates/* -> $OM ; bins -> $LBIN"
 run /bin/mkdir -p -- $OMB $OM/templates $LBIN
-atomic_install $S_OM/bindings.toml $OM/bindings.toml 644
+# Remember where this build lives (the bins find bundled ports through it). A git checkout that
+# already owns the link stays put, so Marchy.app updates never repoint a developer checkout.
+if [[ ! -e $OM/build || ( -L $OM/build && ! -d $OM/build/.git ) ]]; then run /bin/ln -sfn -- $BUILD $OM/build; fi
+# bindings.toml: replace it only if the user has not edited the copy we shipped last time.
+if [[ -f $OM/bindings.toml && -f $OM/.bindings.shipped ]] && ! /usr/bin/cmp -s $OM/bindings.toml $OM/.bindings.shipped \
+   && ! /usr/bin/cmp -s $OM/bindings.toml $S_OM/bindings.toml; then
+  warn "keeping your edited bindings.toml; the new default is bindings.toml.new"
+  atomic_install $S_OM/bindings.toml $OM/bindings.toml.new 644
+else
+  atomic_install $S_OM/bindings.toml $OM/bindings.toml 644
+fi
+atomic_install $S_OM/bindings.toml $OM/.bindings.shipped 644
 for f in $S_OM/bin/*(N.); do
   atomic_install $f $OMB/${f:t} 755
 done

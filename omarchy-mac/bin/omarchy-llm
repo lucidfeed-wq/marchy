@@ -1,0 +1,151 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["anthropic>=1.0", "openai>=1.40"]
+# ///
+"""omarchy-llm: one chat request to the AI provider the user connected (used by omarchy-port).
+
+  omarchy-llm chat    < request.json   -> {"text", "stop_reason", "model", "usage"}
+  omarchy-llm models  < request.json   -> {"models": [...]}
+  omarchy-llm ping    < request.json   -> {"ok": true, "model": ...}
+
+request.json: {"api": "anthropic"|"openai", "model", "base_url", "system", "messages": [{role, content}],
+               "max_tokens"}.  The API key comes from the environment (MARCHY_API_KEY), set by
+omarchy-port from the Keychain or the user's own env vars; it is never written anywhere.
+"""
+import json
+import os
+import sys
+
+
+def out(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def fail(msg, kind="error"):
+    out({"error": msg, "kind": kind}, 1)
+
+
+def detail(e):
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        msg = err.get("message") if isinstance(err, dict) else err
+        if msg:
+            return str(msg)[:300]
+    if isinstance(body, str) and body.strip():
+        return body.strip()[:300]
+    resp = getattr(e, "response", None)
+    if resp is not None and getattr(resp, "text", ""):
+        return resp.text.strip()[:300]
+    return str(getattr(e, "message", e))[:300]
+
+
+def anthropic_client(req):
+    import anthropic
+    kw = {"max_retries": 3, "timeout": 900}
+    key = os.environ.get("MARCHY_API_KEY")
+    if key:
+        kw["api_key"] = key
+    if req.get("base_url"):
+        kw["base_url"] = req["base_url"]
+    return anthropic, anthropic.Anthropic(**kw)
+
+
+def anthropic_chat(req):
+    anthropic, client = anthropic_client(req)
+    params = dict(
+        model=req.get("model") or "claude-opus-5-5",
+        max_tokens=int(req.get("max_tokens") or 64000),
+        system=req.get("system") or "",
+        messages=req["messages"],
+        thinking={"type": "adaptive"},
+        output_config={"effort": req.get("effort") or "high"},
+    )
+    try:
+        # Server-side refusal fallback: if a safety classifier declines, the API reruns the
+        # request on a fallback model inside the same call.
+        with client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **params) as s:
+            msg = s.get_final_message()
+    except TypeError:  # older SDK without the fallbacks parameter
+        with client.messages.stream(**params) as s:
+            msg = s.get_final_message()
+    except anthropic.AuthenticationError:
+        fail("the Anthropic API key was rejected", "auth")
+    except anthropic.RateLimitError as e:
+        fail(f"rate limited by Anthropic: {e}", "rate")
+    except anthropic.APIStatusError as e:
+        fail(f"Anthropic API error {e.status_code}: {detail(e)}")
+    except anthropic.APIConnectionError as e:
+        fail(f"could not reach Anthropic: {e}", "network")
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    if msg.stop_reason == "refusal":
+        fail("the model declined this request", "refusal")
+    u = msg.usage
+    out({"text": text, "stop_reason": msg.stop_reason, "model": msg.model,
+         "usage": {"input": u.input_tokens, "output": u.output_tokens}})
+
+
+def openai_client(req):
+    import openai
+    key = os.environ.get("MARCHY_API_KEY") or "none"  # local servers (Ollama) need no key
+    return openai, openai.OpenAI(api_key=key, base_url=req.get("base_url") or None, timeout=900, max_retries=3)
+
+
+def openai_chat(req):
+    openai, client = openai_client(req)
+    msgs = ([{"role": "system", "content": req["system"]}] if req.get("system") else []) + req["messages"]
+    if not req.get("model"):
+        fail("choose a model for this provider (Marchy > AI, or omarchy-port provider set --model)")
+    try:
+        stream = client.chat.completions.create(model=req["model"], messages=msgs, stream=True)
+        parts, finish, model = [], None, req["model"]
+        for ch in stream:
+            if not ch.choices:
+                continue
+            c = ch.choices[0]
+            if c.delta and c.delta.content:
+                parts.append(c.delta.content)
+            finish = c.finish_reason or finish
+            model = ch.model or model
+    except openai.AuthenticationError:
+        fail("the API key was rejected", "auth")
+    except openai.RateLimitError as e:
+        fail(f"rate limited: {e}", "rate")
+    except openai.APIStatusError as e:
+        kind = "auth" if e.status_code in (400, 401, 403) and "key" in detail(e).lower() else "error"
+        fail(f"API error {e.status_code}: {detail(e)}", kind)
+    except openai.APIConnectionError as e:
+        fail(f"could not reach {req.get('base_url') or 'the API'}: {e}", "network")
+    out({"text": "".join(parts), "stop_reason": finish, "model": model, "usage": {}})
+
+
+def models(req):
+    try:
+        if req["api"] == "anthropic":
+            _, client = anthropic_client(req)
+            ids = [m.id for m in client.models.list()]
+        else:
+            _, client = openai_client(req)
+            ids = sorted(m.id for m in client.models.list())
+    except Exception as e:  # noqa: BLE001 - reported to the UI as text
+        fail(f"could not list models: {str(e)[:300]}")
+    out({"models": ids})
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("chat", "models", "ping"):
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    req = json.load(sys.stdin)
+    if sys.argv[1] == "models":
+        models(req)
+    if sys.argv[1] == "ping":
+        req = dict(req, messages=[{"role": "user", "content": "Reply with the single word: ready"}], max_tokens=2000,
+                   system="", effort="low")
+    (anthropic_chat if req.get("api") == "anthropic" else openai_chat)(req)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,44 @@
+# Push a tag like v0.2.0 -> build Marchy.app on a Mac runner, attach the DMG to a GitHub release,
+# and (if the TAP_TOKEN secret exists) bump the Homebrew cask in <owner>/homebrew-marchy.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          MARCHY_REPOSITORY: ${{ github.repository }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "$VERSION" > VERSION
+          scripts/build-app.sh "$VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "SHA=$(cut -d' ' -f1 build/Marchy-$VERSION.dmg.sha256)" >> $GITHUB_ENV
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "build/Marchy-$VERSION.dmg" "build/Marchy-$VERSION.dmg.sha256" \
+            --title "Marchy $VERSION" --generate-notes
+      - name: Update Homebrew cask
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        if: env.TAP_TOKEN != ''
+        run: |
+          OWNER=${GITHUB_REPOSITORY%%/*}
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-marchy.git" tap
+          mkdir -p tap/Casks
+          sed -e "s/@VERSION@/$VERSION/" -e "s/@SHA256@/$SHA/" -e "s|@REPO@|$GITHUB_REPOSITORY|g" \
+            packaging/homebrew/marchy.rb > tap/Casks/marchy.rb
+          cd tap
+          git config user.name "marchy-release"
+          git config user.email "marchy-release@users.noreply.github.com"
+          git add Casks/marchy.rb
+          git commit -m "marchy $VERSION"
+          git push
