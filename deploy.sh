@@ -188,6 +188,8 @@ cleanup() {
 trap on_err ZERR
 trap cleanup EXIT
 
+export OMARCHY_PORTS_SRC=$BUILD/ports   # omarchy-keys: bundled port actions are valid bindings
+
 # ----------------------------------------------------------------------------- preflight
 (( DRY )) || /bin/mkdir -p -- $STATE     # before the first say/step: they append to $LOG
 step preflight "build=$BUILD  dry-run=$DRY  sandbox=$SANDBOX"
@@ -293,6 +295,8 @@ for f in $S_OM/port/*(N.); do
   atomic_install $f $OM/port/${f:t} 644
 done
 [[ -f $S_OM/CHEATSHEET.md ]] && atomic_install $S_OM/CHEATSHEET.md $OM/CHEATSHEET.md 644
+# Omarchy shell settings for ports (idle timers default to off = macOS keeps its own); never overwrite
+[[ -f $S_OM/shell.json && ! -f $OM/shell.json ]] && atomic_install $S_OM/shell.json $OM/shell.json 644
 for f in $S_OM/bin/*(N.); do
   t=$LBIN/${f:t}
   if [[ -e $t && ! -L $t ]]; then run /bin/rm -f -- $t; fi   # regular file: backed up above
@@ -343,6 +347,12 @@ run /bin/rm -rf -- $NEWHS
 run /bin/mkdir -p -- $NEWHS/generated
 run /usr/bin/rsync -a --exclude '.DS_Store' --exclude 'generated/' -- $BUILD/hammerspoon/omarchy/ $NEWHS/
 run /bin/cp -p -- $GEN/$S_GEN_HS_REL $NEWHS/generated/bindings.lua
+# omarchy-port ports: keep the ones already installed, then add/refresh those bundled in ports/
+run /bin/mkdir -p -- $NEWHS/ports
+[[ -d $HSDIR/omarchy/ports ]] && run /usr/bin/rsync -a -- $HSDIR/omarchy/ports/ $NEWHS/ports/
+for f in $BUILD/ports/*/hammerspoon/*.lua(N.); do
+  run /bin/cp -p -- $f $NEWHS/ports/${f:t}
+done
 if [[ -d $HSDIR/omarchy ]]; then
   run /bin/mv -- $HSDIR/omarchy $BK/hammerspoon-omarchy.replaced
 fi
@@ -398,6 +408,9 @@ step 6 "omniwm-shell -> $OWDIR/shell (widgets first, then shell.toml) ; bar chec
 if [[ -d $BUILD/omniwm-shell ]]; then
   run /bin/mkdir -p -- $OWDIR/shell
   run /usr/bin/rsync -a --exclude '.DS_Store' --exclude '/shell.toml' -- $BUILD/omniwm-shell/ $OWDIR/shell/
+  for w in $BUILD/ports/*/widget/omarchy-*(N/); do    # bar widgets of bundled ports
+    run /usr/bin/rsync -a --exclude '.DS_Store' -- $w/ $OWDIR/shell/widgets/${w:t}/
+  done
   if [[ -f $BUILD/omniwm-shell/shell.toml ]]; then
     atomic_install $BUILD/omniwm-shell/shell.toml $OWDIR/shell/shell.toml 644
   fi

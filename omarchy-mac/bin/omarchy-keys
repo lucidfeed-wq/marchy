@@ -91,6 +91,27 @@ BRIDGE_SLOTS = [
     for sh in (False, True) for n in (16, 17, 18, 19)
 ]
 
+def port_action_ok(name: str) -> bool:
+    """A namespaced action ("osd.volume-up") defined by an installed omarchy-port port."""
+    import re as _re
+    m = _re.match(r"^([a-z0-9-]+)\.[a-z0-9.-]+$", name or "")
+    if not m:
+        return False
+    import os as _os
+    pid = m.group(1)
+    candidates = [Path.home() / ".hammerspoon/omarchy/ports" / f"{pid}.lua"]
+    # deploy.sh exports OMARCHY_PORTS_SRC=<repo>/ports so bundled ports count before install
+    for d in filter(None, _os.environ.get("OMARCHY_PORTS_SRC", "").split(":")):
+        candidates.append(Path(d) / pid / "hammerspoon" / f"{pid}.lua")
+    for mod in candidates:
+        try:
+            if f'["{name}"]' in mod.read_text():
+                return True
+        except OSError:
+            pass
+    return False
+
+
 HS_ACTIONS = {
     "menu", "menu-system", "menu-theme", "menu-background", "menu-capture", "menu-toggle",
     "menu-setup", "keybindings", "terminal", "browser", "browser-private", "finder", "tui",
@@ -492,8 +513,9 @@ def resolve(binds: list[Bind], ids: set[str], paths) -> list[str]:
             except BindError as e:
                 raise BindError(f"bindings.toml:{b.line}: {e}") from None
         elif b.kind == "hs":
-            if b.value not in HS_ACTIONS:
-                raise BindError(f"bindings.toml:{b.line}: unknown Hammerspoon action {b.value!r}")
+            if b.value not in HS_ACTIONS and not port_action_ok(b.value):
+                raise BindError(f"bindings.toml:{b.line}: unknown Hammerspoon action {b.value!r} "
+                                "(port actions need the port installed: omarchy-port install <id>)")
             if b.value in HS_ARG_REQUIRED and not b.arg:
                 raise BindError(f"bindings.toml:{b.line}: hs {b.value!r} needs arg")
             if b.value == "wm":

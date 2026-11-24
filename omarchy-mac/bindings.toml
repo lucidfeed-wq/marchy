@@ -925,3 +925,31 @@ hs = "toggle-gaps"
 # SKIPPED: SUPER+CTRL+ALT+F  "Full-screen desktop (no bar, no gaps)" (no single action; use SUPER+SHIFT+SPACE + SUPER+SHIFT+BACKSPACE)
 
 # SKIPPED: SUPER+CTRL+BACKSPACE  "Single-window square aspect" (not possible in OmniWM)
+
+# ----------------------------------------------------------------------- Media keys (OSD port)
+# Volume / brightness keys show Omarchy's OSD instead of the macOS HUD (omarchy-port osd).
+# Not applied while Citrix Viewer is frontmost (the keys behave as normal macOS keys there).
+[[bind]]
+chord = "VOLUMEUP"
+desc = "Volume up (Omarchy OSD)"
+hs = "osd.volume-up"
+
+[[bind]]
+chord = "VOLUMEDOWN"
+desc = "Volume down (Omarchy OSD)"
+hs = "osd.volume-down"
+
+[[bind]]
+chord = "MUTE"
+desc = "Mute (Omarchy OSD)"
+hs = "osd.volume-mute"
+
+[[bind]]
+chord = "BRIGHTNESSUP"
+desc = "Brightness up (Omarchy OSD)"
+hs = "osd.brightness-up"
+
+[[bind]]
+chord = "BRIGHTNESSDOWN"
+desc = "Brightness down (Omarchy OSD)"
+hs = "osd.brightness-down"

@@ -18,7 +18,9 @@ shows and does, then rebuild it.
 
 1. **Backend → widget (state):** the Hammerspoon port module publishes JSON with
    `hs.task.new("/Applications/OmniWM.app/Contents/MacOS/omniwmctl", cb, { "shell", "set", "omarchy_<id>", json }):start()`.
-   Only publish when the JSON changed. The widget reads it with
+   Only publish when the JSON changed. **OmniWM rejects any var larger than 4096 bytes**
+   (`omniwmctl shell set` fails with `invalid_arguments`): keep each var well under 4000 bytes,
+   trim/round data, cap list lengths, or split into several vars the widget joins. The widget reads it with
    `ctx.select("vars", "omarchy_<id>")` and `json.decode`, caching the decoded value by text.
 2. **Widget → backend (actions):** `onClick = function(_c, _e) omniwm.open("hammerspoon://omarchy?a=<id>.<verb>&x=<urlencoded arg>") end`.
    The action name MUST be namespaced `<id>.<verb>` (e.g. `audio.set-volume`). URL-encode `x`.

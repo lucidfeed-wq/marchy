@@ -318,12 +318,13 @@ local function publishGlobe()
   if okW and type(land) == "table" then
     for _, ring in ipairs(land) do
       if type(ring) == "table" and #ring >= 8 then
+        -- OmniWM rejects shell vars over 4096 bytes: keep every 3rd point, whole degrees.
         local r = {}
-        for i = 1, #ring do
-          local v = tonumber(ring[i]) or 0
-          r[i] = math.floor(v * 10 + 0.5) / 10
+        for i = 1, #ring - 1, 6 do
+          r[#r + 1] = math.floor((tonumber(ring[i]) or 0) + 0.5)
+          r[#r + 1] = math.floor((tonumber(ring[i + 1]) or 0) + 0.5)
         end
-        out.land[#out.land + 1] = r
+        if #r >= 6 then out.land[#out.land + 1] = r end
       end
     end
   end
@@ -339,7 +340,14 @@ local function publishGlobe()
     out.missing = true
     log.w("elsewhen: world.json not found (run omarchy-port sync); the globe draws its graticule only")
   end
+  -- Fit OmniWM's 4096-byte var limit: drop the least prominent cities until it fits.
+  table.sort(out.cities, function(a, b) return (a[5] or 3) < (b[5] or 3) end)
   local text = hs.json.encode(out)
+  while text and #text > 4000 and #out.cities > 0 do
+    table.remove(out.cities)
+    text = hs.json.encode(out)
+  end
+  if text and #text > 4000 then out.land = {} out.missing = true text = hs.json.encode(out) end
   if not text or text == lastGlobePush then return end
   lastGlobePush = text
   pushVar(GLOBE_VAR, text)

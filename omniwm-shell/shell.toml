@@ -10,12 +10,12 @@ profile = "default"
 [profiles.default]
 theme = "omarchy"
 leading = ["omarchy-logo", "omarchy-workspaces", "app-menu"]
-center = ["omarchy-clock"]
+center = ["omarchy-clock", "omarchy-elsewhen", "omarchy-weather"]
 # omarchy-tray mirrors the macOS menu-bar extras (Tailscale, Sync, Maccy, ...)
 # into this bar: Hammerspoon reads them via Accessibility and clicking one opens
 # the real app menu. The macOS menu bar itself is auto-hidden by this full-width
 # bar; app-menu (after the workspaces) keeps File/Edit menus reachable.
-trailing = ["omarchy-tray", "omarchy-bluetooth", "omarchy-wifi", "volume", "battery"]
+trailing = ["omarchy-tray", "omarchy-agents", "omarchy-bluetooth", "omarchy-wifi", "omarchy-audio", "omarchy-monitor", "omarchy-power"]
 
 [profiles.default.workspaceBar]
 position = "overlappingMenuBar"
