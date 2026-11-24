@@ -1,0 +1,12 @@
+{
+  "id": "wifiqr",
+  "status": "ported",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "wifiqr.open",
+    "wifiqr.toggle",
+    "wifiqr.close"
+  ],
+  "hotkeys": []
+}
