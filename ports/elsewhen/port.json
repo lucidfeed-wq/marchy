@@ -1,0 +1,20 @@
+{
+  "id": "elsewhen",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": ["omarchy-port sync (upstream Greetings.js, world.json, cities.json; optional)"],
+  "actions": [
+    "elsewhen.toggle",
+    "elsewhen.add",
+    "elsewhen.here",
+    "elsewhen.close",
+    "elsewhen.remove",
+    "elsewhen.toggle-hour24",
+    "elsewhen.toggle-offset",
+    "elsewhen.toggle-units",
+    "elsewhen.refresh"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + ALT + E", "action": "elsewhen.toggle" }
+  ]
+}

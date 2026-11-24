@@ -1,0 +1,7 @@
+# Options for the omarchy-reminders bar indicator (values arrive in ctx.data.settings;
+# override in shell.toml under [profiles.default.widgets.omarchy-reminders]).
+
+[options.alwaysShow]
+type = "boolean"
+title = "Always show (inactive at 45 %)"
+default = false

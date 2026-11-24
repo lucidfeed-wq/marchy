@@ -1,0 +1,13 @@
+{
+  "id": "speedtest",
+  "status": "ported",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "speedtest.open",
+    "speedtest.toggle",
+    "speedtest.close",
+    "speedtest.run"
+  ],
+  "hotkeys": []
+}

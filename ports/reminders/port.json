@@ -1,0 +1,20 @@
+{
+  "id": "reminders",
+  "status": "ported",
+  "bar": "trailing",
+  "requires": [],
+  "actions": [
+    "reminders.open",
+    "reminders.toggle",
+    "reminders.close",
+    "reminders.show",
+    "reminders.clear",
+    "reminders.set",
+    "reminders.indicator"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + R", "action": "reminders.open" },
+    { "chord": "SUPER + CTRL + ALT + R", "action": "reminders.show" },
+    { "chord": "SUPER + SHIFT + CTRL + R", "action": "reminders.clear" }
+  ]
+}

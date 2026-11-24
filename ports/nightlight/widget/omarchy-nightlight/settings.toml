@@ -1,0 +1,7 @@
+# Options for the omarchy-nightlight bar indicator (values arrive in ctx.data.settings;
+# override in shell.toml under [profiles.default.widgets.omarchy-nightlight]).
+
+[options.alwaysShow]
+type = "boolean"
+title = "Always show (inactive at 45 %)"
+default = false
