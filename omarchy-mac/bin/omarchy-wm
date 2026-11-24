@@ -1,0 +1,222 @@
+#!/bin/sh
+# omarchy-wm: the one implementation of every OmniWM chain and layout-aware action.
+# Called by Karabiner shell_command rules (minimal environment), by Hammerspoon
+# (action "wm"), and by hand. POSIX sh.
+set -eu
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+: "${HOME:=$(/usr/bin/id -P | /usr/bin/cut -d: -f9)}"
+
+OMNIWMCTL=${OMNIWMCTL:-/Applications/OmniWM.app/Contents/MacOS/omniwmctl}
+OMNIWM_SET=${OMARCHY_OMNIWM_SET:-$HOME/.config/omarchy-mac/bin/omarchy-omniwm-set}
+STATE_DIR=$HOME/.local/state/omarchy-mac
+LOG=$STATE_DIR/dispatch.log
+DRY_RUN=${DRY_RUN:-0}
+
+usage() {
+	cat <<'EOF'
+Usage: omarchy-wm <verb> [args...]
+
+Verbs:
+  raw <omniwmctl command args...>     omniwmctl command <args>
+  move-follow <N>                     move window to workspace N, then switch to N
+  move-silent <N>                     move window to workspace N (stay here)
+  resize <x|y> <-|+> [fine|coarse]    layout-aware resize of the focused window
+                                        dwindle: resize horizontal|vertical grow|shrink
+                                                 (normal 1x, fine 1x, coarse 3x)
+                                        niri:    x -> set-container-primary-span +/-5%
+                                                 y -> set-window-secondary-span  +/-5%
+                                                 (fine 2%, coarse 15%)
+  fullwidth                           niri: toggle-container-full-primary-span
+                                      dwindle: toggle-fullscreen
+  cycle-layout [reverse]              toggle-workspace-layout (dwindle <-> niri)
+  ws-to-monitor <left|right|up|down>  move the active workspace to that monitor
+                                      (--force runtime override; the workspace's
+                                      monitorAssignment is not rewritten)
+  gaps-toggle                         gaps.size 5<->0 and gaps.outer.* 10<->0
+                                      (through omarchy-omniwm-set)
+  layout                              print the focused workspace layout (read-only)
+  help, -h, --help                    this help
+
+Environment:
+  DRY_RUN=1             print the omniwmctl / omarchy-omniwm-set commands instead
+                        of running them (read-only queries still run)
+  OMARCHY_WM_LAYOUT     force the detected layout (niri|dwindle), for testing
+  OMNIWMCTL             omniwmctl path (default the OmniWM.app binary)
+  OMARCHY_OMNIWM_SET    omarchy-omniwm-set path
+
+Every call is logged with a timestamp and exit code to
+~/.local/state/omarchy-mac/dispatch.log (rotated to dispatch.log.1 at 1 MiB).
+EOF
+}
+
+LOG_MAX=1048576 # bytes; dispatch.log is rotated to dispatch.log.1 above this
+
+log_line() {
+	/bin/mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+	if [ -f "$LOG" ] && [ "$(/usr/bin/stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
+		/bin/mv -f "$LOG" "$LOG.1" 2>/dev/null || :
+	fi
+	printf '%s %s%s rc=%s\n' "$(/bin/date '+%Y-%m-%dT%H:%M:%S')" \
+		"$([ "$DRY_RUN" = 1 ] && printf 'DRY ')" "$1" "$2" >>"$LOG" 2>/dev/null || :
+}
+
+die() {
+	printf 'omarchy-wm: %s\n' "$*" >&2
+	exit 2
+}
+
+# Run (or, with DRY_RUN=1, print) one state-changing command.
+run() {
+	if [ "$DRY_RUN" = 1 ]; then
+		printf '%s\n' "$*"
+		return 0
+	fi
+	"$@" >/dev/null
+}
+
+wm() { run "$OMNIWMCTL" command "$@"; }
+
+# Focused workspace as ndjson (read-only query). Falls back across selectors
+# because --focused can briefly be empty while an unmanaged window has focus.
+ws_json() {
+	for sel in --focused --current; do
+		out=$("$OMNIWMCTL" query workspaces "$sel" --format ndjson 2>/dev/null || :)
+		case $out in
+		*'"layout"'*) printf '%s\n' "$out"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+ws_layout() {
+	if [ -n "${OMARCHY_WM_LAYOUT:-}" ]; then
+		printf '%s\n' "$OMARCHY_WM_LAYOUT"
+		return 0
+	fi
+	l=$(ws_json | /usr/bin/sed -n 's/.*"layout":"\([a-z]*\)".*/\1/p' | /usr/bin/head -n1) || l=
+	# OmniWM reports the effective layout; "default" should not appear, but be safe.
+	case $l in
+	niri | dwindle) printf '%s\n' "$l" ;;
+	*) printf 'dwindle\n' ;;
+	esac
+}
+
+ws_name() {
+	if [ -n "${OMARCHY_WM_WORKSPACE:-}" ]; then
+		printf '%s\n' "$OMARCHY_WM_WORKSPACE"
+		return 0
+	fi
+	ws_json | /usr/bin/sed -n 's/.*"rawName":"\([^"]*\)".*/\1/p' | /usr/bin/head -n1
+}
+
+is_ws_number() {
+	case ${1:-} in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] && [ "$1" -le 99 ]
+}
+
+is_dir() {
+	case ${1:-} in
+	left | right | up | down) return 0 ;;
+	esac
+	return 1
+}
+
+do_resize() {
+	axis=${1:-}
+	sign=${2:-}
+	step=${3:-normal}
+	case $axis in x | y) ;; *) die "resize: axis must be x or y" ;; esac
+	case $sign in - | +) ;; *) die "resize: direction must be - or +" ;; esac
+	case $step in normal | fine | coarse) ;; *) die "resize: step must be fine or coarse" ;; esac
+	layout=$(ws_layout)
+	if [ "$layout" = niri ]; then
+		case $step in normal) pct=5 ;; fine) pct=2 ;; coarse) pct=15 ;; esac
+		if [ "$axis" = x ]; then
+			wm set-container-primary-span "$sign$pct%"
+		else
+			wm set-window-secondary-span "$sign$pct%"
+		fi
+	else
+		if [ "$axis" = x ]; then dir=horizontal; else dir=vertical; fi
+		if [ "$sign" = + ]; then op=grow; else op=shrink; fi
+		n=1
+		[ "$step" = coarse ] && n=3
+		i=0
+		while [ "$i" -lt "$n" ]; do
+			wm resize "$dir" "$op"
+			i=$((i + 1))
+		done
+	fi
+}
+
+# One locked read-modify-write in omarchy-omniwm-set: gaps.size decides
+# (0 -> restore 5 / 10, anything else -> 0 / 0), so two quick presses cannot
+# race each other.
+do_gaps_toggle() {
+	[ -x "$OMNIWM_SET" ] || die "gaps-toggle: $OMNIWM_SET not found"
+	run "$OMNIWM_SET" -q --toggle gaps.size=5,0 --toggle gaps.outer.top=10,0 \
+		--toggle gaps.outer.bottom=10,0 --toggle gaps.outer.left=10,0 --toggle gaps.outer.right=10,0
+}
+
+main() {
+	[ $# -ge 1 ] || { usage >&2; exit 2; }
+	verb=$1
+	shift
+	case $verb in
+	help | -h | --help) usage; exit 0 ;;
+	raw)
+		[ $# -ge 1 ] || die "raw: missing omniwmctl command"
+		wm "$@"
+		;;
+	move-follow)
+		is_ws_number "${1:-}" || die "move-follow: workspace number required"
+		wm move-to-workspace "$1"
+		wm switch-workspace "$1"
+		;;
+	move-silent)
+		is_ws_number "${1:-}" || die "move-silent: workspace number required"
+		wm move-to-workspace "$1"
+		;;
+	resize) do_resize "$@" ;;
+	fullwidth)
+		if [ "$(ws_layout)" = niri ]; then
+			wm toggle-container-full-primary-span
+		else
+			wm toggle-fullscreen
+		fi
+		;;
+	cycle-layout)
+		case ${1:-} in '' | reverse) ;; *) die "cycle-layout: only 'reverse' is accepted" ;; esac
+		# Only two tiling layouts exist in OmniWM, so reverse == forward.
+		wm toggle-workspace-layout
+		;;
+	ws-to-monitor)
+		is_dir "${1:-}" || die "ws-to-monitor: direction must be left|right|up|down"
+		ws=$(ws_name) || ws=
+		[ -n "$ws" ] || die "ws-to-monitor: could not read the active workspace"
+		# --force: the same temporary runtime override OmniWM's own
+		# "Move Workspace to Monitor" hotkeys use; without it a workspace with a
+		# monitorAssignment (all of ours) is refused. Home Monitor is unchanged.
+		run "$OMNIWMCTL" workspace move-to-monitor "$ws" "$1" --force
+		;;
+	gaps-toggle) do_gaps_toggle ;;
+	layout) ws_layout ;;
+	*) die "unknown verb '$verb' (try --help)" ;;
+	esac
+}
+
+# Run main in a subshell with errexit active (an `|| rc=$?` list would disable
+# errexit inside it), then log the exit code.
+set +e
+(
+	set -e
+	main "$@"
+)
+rc=$?
+set -e
+case ${1:-} in help | -h | --help | layout | '') ;; *) log_line "$*" "$rc" ;; esac
+exit "$rc"

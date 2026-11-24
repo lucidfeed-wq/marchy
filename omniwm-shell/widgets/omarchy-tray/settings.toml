@@ -1,0 +1,27 @@
+# Options for the omarchy-tray bar widget (values arrive in ctx.data.settings;
+# override them in shell.toml under [profiles.default.widgets.omarchy-tray]).
+
+[options.hide]
+type = "string"
+title = "Items to leave out: comma-separated bundle IDs, item keys (io.tailscale.ipn.macos@1) or AXIdentifiers"
+default = "com.apple.MenuBarAgent"
+maxLength = 1024
+
+[options.maxInline]
+type = "number"
+title = "Items shown in the bar before the overflow chevron"
+default = 12
+min = 1
+max = 40
+step = 1
+
+[options.showValues]
+type = "boolean"
+title = "Show item text values (for example Battery 88%)"
+default = true
+
+[options.color]
+type = "string"
+title = "Symbol color for Apple items (palette role or #RRGGBB)"
+default = "foreground"
+maxLength = 32

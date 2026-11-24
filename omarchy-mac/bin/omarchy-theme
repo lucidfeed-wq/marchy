@@ -1,0 +1,1067 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Omarchy themes on macOS.
+
+  omarchy-theme set <name>        switch everything to a theme
+  omarchy-theme bg-next           next background of the current theme
+  omarchy-theme bg-set <path|N>   pick a background of the current theme
+  omarchy-theme bg-list [--json]  backgrounds of the current theme
+  omarchy-theme list [--json]     available themes
+  omarchy-theme current           current theme name
+  omarchy-theme check [name...]   resolve + render without writing (all themes by default)
+
+Testing. `check` is the no-write preview and is safe anywhere. For a full
+switch without touching the desktop, point HOME at a test home: whenever HOME
+is not the login user's home directory every run is a dry run (forced), which
+writes the files under that HOME but sends no signals, runs no osascript and no
+omniwmctl, and edits <HOME>/.config/omniwm/settings.toml with
+`omarchy-omniwm-set --file ... --no-ping`. `--dry-run` (or
+OMARCHY_THEME_DRY_RUN=1) is accepted only with such a test home for set,
+bg-next and bg-set; with the real HOME it is refused (exit 2), because those
+commands always write files.
+
+One switch restyles Ghostty, the OmniWM border and OmniShell palette, btop,
+Neovim, Herdr, the wallpaper and macOS light/dark. Hammerspoon notices the
+switch itself: it watches ~/.config/omarchy-mac/current/theme.name, which is
+always written last. This script never calls `hs`.
+"""
+import os
+import sys
+
+if sys.version_info < (3, 11):  # e.g. run explicitly with Apple's /usr/bin/python3 (3.9)
+    sys.exit("omarchy-theme: needs Python 3.11+ (run it directly; its uv shebang picks one)")
+
+import argparse
+import errno
+import fcntl
+import glob
+import json
+import pwd
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+
+import tomllib
+
+CTL = "/Applications/OmniWM.app/Contents/MacOS/omniwmctl"
+SIPS = "/usr/bin/sips"
+OSASCRIPT = "/usr/bin/osascript"
+PKILL = "/usr/bin/pkill"
+DEFAULTS = "/usr/bin/defaults"
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif", ".tif", ".tiff")
+HEX6 = re.compile(r"^#[0-9a-fA-F]{6}$")
+HEX_ANY = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+SAFE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+# Same charset upstream omarchy-theme-color accepts for values.
+SAFE_VALUE = re.compile(r"^[A-Za-z0-9#(),._+/% -]*$")
+THEME_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+# Every key a consumer may ask for. After the cascade each must be #rrggbb.
+CANONICAL = [
+    "background", "dark_background", "darker_background", "lighter_background",
+    "foreground", "dark_foreground", "light_foreground", "bright_foreground",
+    "accent", "selection", "selection_background", "selection_foreground", "muted", "cursor",
+    "red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown",
+    "bright_red", "bright_yellow", "bright_green", "bright_cyan", "bright_blue", "bright_magenta",
+] + ["color%d" % i for i in range(16)]
+
+LEGACY_PALETTE = {  # canonical -> legacy short name
+    "background": "bg", "dark_background": "dark_bg", "darker_background": "darker_bg",
+    "lighter_background": "lighter_bg", "foreground": "fg", "dark_foreground": "dark_fg",
+    "light_foreground": "light_fg", "bright_foreground": "bright_fg",
+}
+LEGACY_ANSI = {
+    "red": "color1", "green": "color2", "yellow": "color3", "blue": "color4",
+    "magenta": "color5", "cyan": "color6", "bright_red": "color9", "bright_green": "color10",
+    "bright_yellow": "color11", "bright_blue": "color12", "bright_magenta": "color13",
+    "bright_cyan": "color14",
+}
+ANSI_ORDER = [
+    "background", "red", "green", "yellow", "blue", "magenta", "cyan", "foreground",
+    "muted", "bright_red", "bright_green", "bright_yellow", "bright_blue", "bright_magenta",
+    "bright_cyan", "bright_foreground",
+]
+
+# OmniShell palette roles (same set as shell/default/themes/*.toml in OmniWM 0.8).
+SHELL_ROLES = [
+    "background", "surface", "elevatedSurface", "foreground", "secondaryForeground",
+    "mutedForeground", "border", "accent", "accentForeground", "success", "warning", "error",
+    "focus", "shadow", "scrim", "badge", "red", "orange", "yellow", "green", "mint", "teal",
+    "cyan", "blue", "indigo", "purple", "pink", "brown", "gray",
+]
+
+# Rendered file name -> where it is published (relative to HOME) and the
+# directory that must already exist for it to be published at all.
+PUBLISH = {
+    "ghostty.conf": (".config/omarchy-mac/current/ghostty.conf", ".config/omarchy-mac/current"),
+    "btop.theme": (".config/btop/themes/omarchy.theme", None),
+    "neovim.lua": (".config/nvim/lua/plugins/omarchy-theme.lua", ".config/nvim/lua/plugins"),
+    "herdr-app.json": (".config/herdr-app/themes/omarchy.json", ".config/herdr-app"),
+    "omniwm-shell.toml": (".config/omniwm/shell/themes/omarchy.toml", ".config/omniwm/shell"),
+}
+
+
+class ThemeError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------- paths
+
+
+class Paths:
+    def __init__(self):
+        self.home = os.path.expanduser("~")
+        self.base = os.path.join(self.home, ".config/omarchy-mac")
+        self.themes = os.path.join(self.base, "themes")
+        self.templates = os.path.join(self.base, "templates")
+        self.current = os.path.join(self.base, "current")
+        self.theme_dir = os.path.join(self.current, "theme")
+        self.backgrounds = os.path.join(self.current, "backgrounds")
+        self.state = os.path.join(self.home, ".local/state/omarchy-mac")
+        self.omniwm_settings = os.path.join(self.home, ".config/omniwm/settings.toml")
+        self.omniwm_set = os.environ.get("OMARCHY_OMNIWM_SET") or os.path.join(self.base, "bin/omarchy-omniwm-set")
+
+    def h(self, rel):
+        return os.path.join(self.home, rel)
+
+
+P = None  # set in main()
+DRY = False
+TEST_HOME = False  # HOME is not the login user's home: every run is a dry run
+WARNINGS = []
+
+
+def warn(msg):
+    WARNINGS.append(msg)
+    print("omarchy-theme: " + msg, file=sys.stderr)
+
+
+def log(msg):
+    try:
+        os.makedirs(P.state, exist_ok=True)
+        with open(os.path.join(P.state, "theme.log"), "a") as fh:
+            fh.write("%s %s%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), "[dry-run] " if DRY else "", msg))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- files
+
+
+def atomic_write(path, text, mode=0o644):
+    """Write text to path through a temp file in the same directory + rename."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), dir=d)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_text(path, default=None):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return default
+
+
+class Lock:
+    """Exclusive flock on ~/.local/state/omarchy-mac/theme.lock (waits up to 120 s)."""
+
+    def __init__(self, timeout=120.0):
+        self.timeout = timeout
+        self.fh = None
+
+    def __enter__(self):
+        os.makedirs(P.state, exist_ok=True)
+        self.fh = open(os.path.join(P.state, "theme.lock"), "a+")
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    raise
+                if time.time() > deadline:
+                    raise ThemeError("another theme switch is still running (theme.lock busy)")
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+
+
+def run(args, timeout=15, side_effect=True):
+    """Run a command; side effects are skipped in dry-run. Never raises."""
+    if side_effect and DRY:
+        log("dry-run skip: " + " ".join(args))
+        return None
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except Exception as exc:  # a missing tool must not stop the rest of the switch
+        warn("skipped %s: %s" % (os.path.basename(args[0]), exc))
+        return None
+
+
+# --------------------------------------------------------------------------- colors
+
+
+def load_raw_colors(path):
+    text = read_text(path)
+    if text is None:
+        raise ThemeError("cannot read " + path)
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ThemeError("%s: %s" % (path, exc))
+    raw = {}
+    for key, value in data.items():
+        if isinstance(value, dict) or isinstance(value, list):
+            continue  # tables/arrays are not part of the palette
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        value = str(value).strip()
+        if not SAFE_KEY.match(key):
+            warn("%s: skipping key %r (unsupported characters)" % (path, key))
+            continue
+        if not SAFE_VALUE.match(value):
+            warn("%s: skipping %s (unsupported characters in value)" % (path, key))
+            continue
+        raw[key] = value
+    return raw
+
+
+def norm_hex(value):
+    """'#ABC' / '#AABBCC' / '#AABBCCDD' -> '#aabbcc'; anything else unchanged."""
+    if isinstance(value, str) and HEX_ANY.match(value):
+        v = value[1:].lower()
+        if len(v) == 3:
+            v = "".join(c * 2 for c in v)
+        return "#" + v[:6]
+    return value
+
+
+def mix(start, end, amount):
+    """Upstream mix_color: linear RGB mix, amount 0..1 (or '30%'), +0.5 rounding."""
+    if isinstance(amount, str):
+        a = amount.strip()
+        amount = float(a[:-1]) / 100 if a.endswith("%") else float(a)
+    if amount > 1:
+        amount = amount / 100
+    amount = max(0.0, min(1.0, amount))
+    s, e = norm_hex(start)[1:], norm_hex(end)[1:]
+    rgb = []
+    for i in (0, 2, 4):
+        a, b = int(s[i:i + 2], 16), int(e[i:i + 2], 16)
+        rgb.append(int(a * (1 - amount) + b * amount + 0.5))
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def rgb_floats(hexv):
+    h = norm_hex(hexv)[1:]
+    return [round(int(h[i:i + 2], 16) / 255, 3) for i in (0, 2, 4)]
+
+
+def luminance_sum(hexv):
+    h = norm_hex(hexv)[1:]
+    return sum(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def resolve_colors(theme_dir):
+    """Port of upstream omarchy-theme-color resolve_theme_colors (4.5 / quattro)."""
+    raw = load_raw_colors(os.path.join(theme_dir, "colors.toml"))
+    c = {k: norm_hex(v) for k, v in raw.items()}
+
+    def alias(key, fallback):
+        if not c.get(key) and c.get(fallback):
+            c[key] = c[fallback]
+
+    def default(key, value):
+        if not c.get(key) and value:
+            c[key] = value
+
+    for key, legacy in LEGACY_PALETTE.items():
+        alias(key, legacy)
+    default("background", c.get("color0"))
+    default("foreground", c.get("color7"))
+    if c.get("background"):
+        c["color0"] = c["background"]
+    if c.get("foreground"):
+        c["color7"] = c["foreground"]
+    for key, legacy in LEGACY_ANSI.items():
+        alias(key, legacy)
+    alias("magenta", "purple")
+    alias("bright_magenta", "bright_purple")
+
+    if not c.get("background") or not c.get("foreground"):
+        raise ThemeError("colors.toml defines neither background/foreground nor color0/color7")
+
+    default("light_foreground", c.get("color7") or c.get("foreground"))
+    default("bright_foreground", c.get("color15") or c.get("foreground"))
+    c["cursor"] = c["bright_foreground"]
+    default("lighter_background", c.get("color0") or c.get("background"))
+    default("dark_foreground", c.get("color8") or c.get("foreground"))
+    default("muted", c.get("color8") or c.get("dark_foreground"))
+    default("selection", c.get("selection_background") or c.get("color8") or c.get("color0") or c.get("background"))
+    default("selection_background", c.get("selection"))
+    default("selection_foreground", c.get("bright_foreground"))
+    # Mac-port extension: upstream has no accent fallback (templates would keep
+    # a raw {{ accent }}). Blue is what most Omarchy themes use as accent.
+    default("accent", c.get("blue") or c.get("color4") or c.get("foreground"))
+    # Mac-port extension: a theme with no hues at all gets them from the ANSI-ish
+    # defaults of its foreground so nothing downstream breaks.
+    for hue in ("red", "green", "yellow", "blue", "magenta", "cyan"):
+        default(hue, c.get("foreground"))
+    default("orange", c.get("yellow"))
+    if not c.get("brown") and HEX6.match(c.get("orange", "")):
+        c["brown"] = mix(c["orange"], "#000000", 0.5)
+
+    if HEX6.match(c["background"]):
+        default("dark_background", mix(c["background"], "#000000", 0.25))
+        default("darker_background", mix(c["background"], "#000000", 0.5))
+    for hue in ("red", "yellow", "green", "cyan", "blue", "magenta"):
+        if not c.get("bright_" + hue) and HEX6.match(c.get(hue, "")):
+            c["bright_" + hue] = mix(c[hue], "#ffffff", 0.2)
+    alias("purple", "magenta")
+    alias("bright_purple", "bright_magenta")
+
+    for i, key in enumerate(ANSI_ORDER):
+        default("color%d" % i, c.get(key))
+    for key, legacy in LEGACY_PALETTE.items():
+        if c.get(key):
+            c[legacy] = c[key]
+
+    # Mode: `mode`, legacy `theme_type`, light.mode marker, luminance, dark.
+    mode = (c.get("mode") or c.get("theme_type") or "").lower()
+    if mode not in ("light", "dark"):
+        if os.path.exists(os.path.join(theme_dir, "light.mode")):
+            mode = "light"
+        elif HEX6.match(c["background"]):
+            mode = "light" if luminance_sum(c["background"]) > 382 else "dark"
+        else:
+            mode = "dark"
+    c["mode"] = mode
+    c["theme_type"] = mode
+
+    bad = [k for k in CANONICAL if not HEX6.match(c.get(k, ""))]
+    if bad:
+        raise ThemeError("unresolved or non-hex colours: " + ", ".join("%s=%r" % (k, c.get(k)) for k in bad))
+    return c
+
+
+# --------------------------------------------------------------------------- gradients
+
+
+def color_to_hex(value, c):
+    value = c.get(value.strip(), value.strip())
+    m = re.match(r"^#([0-9A-Fa-f]{6})([0-9A-Fa-f]{2})?$", value)
+    if m:
+        return "#" + m.group(1).lower()
+    m = re.match(r"^[Rr][Gg][Bb][Aa]?\(([0-9A-Fa-f]{6})([0-9A-Fa-f]{2})?\)$", value)
+    if m:
+        return "#" + m.group(1).lower()
+    m = re.match(r"^[Rr][Gg][Bb][Aa]?\((\d+),(\d+),(\d+)(,[0-9.]+)?\)$", value)
+    if m:
+        return "#%02x%02x%02x" % tuple(min(255, int(m.group(i))) for i in (1, 2, 3))
+    m = re.match(r"^0x[0-9A-Fa-f]{2}([0-9A-Fa-f]{6})$", value)
+    if m:
+        return "#" + m.group(1).lower()
+    return value
+
+
+def parse_gradient(spec, c):
+    colors, angle = [], None
+    for part in spec.split():
+        if re.match(r"^-?\d+(\.\d+)?deg$", part):
+            angle = part[:-3]
+        else:
+            colors.append(c.get(part, part))
+    return colors, angle
+
+
+def resolve_ref(key, fallback, c):
+    if key in c:
+        return c[key]
+    if fallback and fallback in c:
+        return c[fallback]
+    return fallback or key
+
+
+def gradient_start(key, fallback, c):
+    spec = resolve_ref(key, fallback, c)
+    colors, _ = parse_gradient(spec, c)
+    return color_to_hex(colors[0] if colors else spec, c)
+
+
+def shell_gradient(key, fallback, c):
+    spec = resolve_ref(key, fallback, c)
+    colors, angle = parse_gradient(spec, c)
+    if not colors:
+        return spec
+    return " ".join(colors) + (" %sdeg" % angle if angle else "")
+
+
+def hypr_gradient(key, fallback, c):
+    spec = resolve_ref(key, fallback, c)
+    colors, angle = parse_gradient(spec, c)
+    if not colors:
+        return '"%s"' % spec
+    if len(colors) == 1:
+        return '"%s"' % colors[0]
+    out = "{ colors = {" + ",".join(' "%s"' % x for x in colors) + " }"
+    if angle:
+        out += ", angle = " + angle
+    return out + " }"
+
+
+# --------------------------------------------------------------------------- templates
+
+TOKEN = re.compile(r"\{\{\s*(.*?)\s*\}\}")
+
+
+def render_template(text, c):
+    """Render upstream placeholders. Returns (text, [unresolved tokens])."""
+    missing = []
+
+    def sub(m):
+        expr = m.group(1)
+        parts = expr.split()
+        try:
+            if parts and re.match(r"^mix(_strip|_rgb)?$", parts[0]) and len(parts) == 4:
+                a, b = c.get(parts[1], ""), c.get(parts[2], "")
+                if HEX6.match(a) and HEX6.match(b):
+                    v = mix(a, b, parts[3])
+                    if parts[0] == "mix_strip":
+                        return v[1:]
+                    if parts[0] == "mix_rgb":
+                        return "%d,%d,%d" % tuple(int(v[i:i + 2], 16) for i in (1, 3, 5))
+                    return v
+            elif parts and parts[0] in ("hypr_gradient", "gradient_start", "shell_gradient") and len(parts) in (2, 3):
+                fb = parts[2] if len(parts) == 3 else ""
+                fn = {"hypr_gradient": hypr_gradient, "gradient_start": gradient_start,
+                      "shell_gradient": shell_gradient}[parts[0]]
+                return fn(parts[1], fb, c)
+            elif len(parts) == 1:
+                key = parts[0]
+                if key in c:
+                    return c[key]
+                if key.endswith("_strip") and key[:-6] in c:
+                    return c[key[:-6]].lstrip("#")
+                if key.endswith("_rgb") and HEX6.match(c.get(key[:-4], "")):
+                    v = c[key[:-4]]
+                    return "%d,%d,%d" % tuple(int(v[i:i + 2], 16) for i in (1, 3, 5))
+        except (ValueError, IndexError):
+            pass
+        missing.append(m.group(0))
+        return m.group(0)
+
+    return TOKEN.sub(sub, text), missing
+
+
+def template_files():
+    """User templates in ~/.config/omarchy-mac/templates/*.tpl."""
+    return sorted(glob.glob(os.path.join(P.templates, "*.tpl")))
+
+
+# --------------------------------------------------------------------------- outputs
+
+
+def omnishell_palette(c):
+    """[light] and [dark] OmniShell palettes. The theme's own mode gets the exact
+    Omarchy colours; the other appearance gets a derived counterpart so a manual
+    macOS appearance flip still looks deliberate."""
+
+    def roles(bg, fg, dim_fg, lighter, border, accent, hues, shadow):
+        elevated = lighter if lighter.lower() != bg.lower() else mix(bg, fg, 0.08)
+        return {
+            "background": bg,
+            "surface": bg,
+            "elevatedSurface": elevated,
+            "foreground": fg,
+            "secondaryForeground": mix(fg, bg, 0.2),
+            "mutedForeground": dim_fg,
+            "border": border,
+            "accent": accent,
+            "accentForeground": bg,
+            "success": hues["green"],
+            "warning": hues["yellow"],
+            "error": hues["red"],
+            "focus": accent,
+            "shadow": shadow,
+            "scrim": shadow + "66",
+            "badge": hues["red"],
+            "red": hues["red"],
+            "orange": hues["orange"],
+            "yellow": hues["yellow"],
+            "green": hues["green"],
+            "mint": hues["bright_green"],
+            "teal": hues["cyan"],
+            "cyan": hues["bright_cyan"],
+            "blue": hues["blue"],
+            "indigo": hues["bright_blue"],
+            "purple": hues["magenta"],
+            "pink": hues["bright_magenta"],
+            "brown": hues["brown"],
+            "gray": border,
+        }
+
+    hue_keys = ["red", "orange", "yellow", "green", "cyan", "blue", "magenta", "brown",
+                "bright_green", "bright_cyan", "bright_blue", "bright_magenta"]
+    native = roles(c["background"], c["foreground"], c["dark_foreground"], c["lighter_background"],
+                   c["muted"], c["accent"], {k: c[k] for k in hue_keys}, c["darker_background"])
+    if c["mode"] == "dark":
+        # Light counterpart: paper tinted by the theme's foreground, ink = theme background.
+        bg = mix(c["foreground"], "#ffffff", 0.85)
+        fg = c["background"] if luminance_sum(c["background"]) < 200 else "#1a1a1a"
+        darken = lambda x: mix(x, "#000000", 0.35)
+        other = roles(bg, fg, mix(fg, bg, 0.45), mix(bg, fg, 0.06), mix(bg, fg, 0.2),
+                      darken(c["accent"]), {k: darken(c[k]) for k in hue_keys}, mix(fg, "#000000", 0.5))
+        light, dark = other, native
+    else:
+        # Dark counterpart: deep surface from the theme's foreground, text = theme background.
+        bg = mix(c["foreground"], "#000000", 0.7)
+        fg = c["background"] if luminance_sum(c["background"]) > 560 else "#ececec"
+        lighten = lambda x: mix(x, "#ffffff", 0.3)
+        other = roles(bg, fg, mix(fg, bg, 0.45), mix(bg, fg, 0.08), mix(bg, fg, 0.2),
+                      lighten(c["accent"]), {k: lighten(c[k]) for k in hue_keys}, mix(bg, "#000000", 0.6))
+        light, dark = native, other
+
+    def section(name, r):
+        return "[%s]\n" % name + "".join('%s = "%s"\n' % (k, r[k].upper()) for k in SHELL_ROLES)
+
+    header = ("# Generated by omarchy-theme from the Omarchy theme %r (%s). Do not edit:\n"
+              "# the next `omarchy-theme set` rewrites it.\n\n") % (c.get("_name", "?"), c["mode"])
+    return header + section("light", light) + "\n" + section("dark", dark)
+
+
+def colors_json(c, name, border):
+    out = {"name": name, "title": title_of(name), "mode": c["mode"], "border": border}
+    for k in CANONICAL:
+        if not k.startswith("color"):
+            out[k] = c[k]
+    out["ansi"] = [c["color%d" % i] for i in range(16)]
+    for extra in ("icon_mark", "hyprland_active_border", "hyprland_inactive_border",
+                  "active_border_color", "active_tab_background"):
+        if extra in c:
+            out[extra] = c[extra]
+    return json.dumps(out, indent=2) + "\n"
+
+
+def title_of(name):
+    return " ".join(w[:1].upper() + w[1:] for w in name.split("-"))
+
+
+def validate_output(fname, text):
+    """Syntax checks for what we publish. Raises ThemeError."""
+    if fname.endswith(".json"):
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise ThemeError("%s is not valid JSON: %s" % (fname, exc))
+        if fname == "herdr-app.json":
+            for k in ("background", "foreground", "selection", "cursor"):
+                if not HEX6.match(str(data.get(k, ""))):
+                    raise ThemeError("herdr-app.json: %s is not #rrggbb" % k)
+            if not (isinstance(data.get("ansi"), list) and len(data["ansi"]) == 16
+                    and all(HEX6.match(str(x)) for x in data["ansi"])):
+                raise ThemeError("herdr-app.json: ansi must be 16 #rrggbb colours")
+    elif fname.endswith(".toml"):
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ThemeError("%s is not valid TOML: %s" % (fname, exc))
+    elif fname == "ghostty.conf":
+        for n, line in enumerate(text.splitlines(), 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            m = re.match(r"^([a-z0-9-]+)\s*=\s*(.+)$", s)
+            if not m:
+                raise ThemeError("ghostty.conf:%d is not `key = value`" % n)
+            val = m.group(2).split("=")[-1].strip()
+            if m.group(1) in ("background", "foreground", "cursor-color", "selection-background",
+                              "selection-foreground", "palette") and not HEX6.match(val):
+                raise ThemeError("ghostty.conf:%d colour %r is not #rrggbb" % (n, val))
+    elif fname == "btop.theme":
+        for n, line in enumerate(text.splitlines(), 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            m = re.match(r'^(theme\[[a-z_0-9]+\]|[a-z_]+)\s*=\s*(.*)$', s)
+            if not m:
+                raise ThemeError("btop.theme:%d unexpected line %r" % (n, s))
+            if m.group(1).startswith("theme[") and not re.match(
+                    r'^"(#[0-9A-Fa-f]{6}|#[0-9A-Fa-f]{2}|[0-9 ]*|)"$', m.group(2)):
+                raise ThemeError("btop.theme:%d bad colour %r" % (n, m.group(2)))
+    if "{{" in text and fname != "neovim.lua":
+        raise ThemeError("%s still contains a {{ placeholder }}" % fname)
+
+
+def build_theme(name):
+    """Resolve, render and validate everything for a theme, in memory.
+    Returns (colors, {output-name: text})."""
+    theme_dir = os.path.join(P.themes, name)
+    c = resolve_colors(theme_dir)
+    c["_name"] = name
+    border = gradient_start("hyprland_active_border", "accent", c)
+    if not HEX6.match(border):
+        border = c["accent"]
+    outputs = {}
+    used = {"ghostty.conf", "btop.theme", "neovim.lua", "herdr-app.json"}
+    for tpl in template_files():
+        fname = os.path.basename(tpl)[:-4]
+        shipped = os.path.join(theme_dir, fname)
+        if os.path.isfile(shipped):
+            outputs[fname] = read_text(shipped)  # a theme's own file wins (upstream rule)
+            continue
+        text, missing = render_template(read_text(tpl, ""), c)
+        if missing:
+            msg = "%s: unresolved %s" % (os.path.basename(tpl), ", ".join(sorted(set(missing))))
+            if fname in used:
+                raise ThemeError(msg)
+            warn(msg)
+        outputs[fname] = text
+    for fname in used:  # themes may ship a file we have no template for
+        shipped = os.path.join(theme_dir, fname)
+        if fname not in outputs and os.path.isfile(shipped):
+            outputs[fname] = read_text(shipped)
+    outputs["omniwm-shell.toml"] = omnishell_palette(c)
+    outputs["colors.json"] = colors_json(c, name, border)
+    for fname, text in outputs.items():
+        if fname in used or fname in ("omniwm-shell.toml", "colors.json"):
+            validate_output(fname, text)
+    for required in ("ghostty.conf", "btop.theme", "neovim.lua"):
+        if required not in outputs:
+            raise ThemeError("no %s: template %s.tpl missing from %s" % (required, required, P.templates))
+    c["_border"] = border
+    return c, outputs
+
+
+def stage_and_swap(name, outputs):
+    """Write outputs to current/next-<pid>, then swap it in as current/theme."""
+    os.makedirs(P.current, exist_ok=True)
+    nxt = os.path.join(P.current, ".next-theme-%d" % os.getpid())
+    old = os.path.join(P.current, ".old-theme-%d" % os.getpid())
+    shutil.rmtree(nxt, ignore_errors=True)
+    os.makedirs(nxt)
+    src = os.path.join(P.themes, name)
+    shutil.copy2(os.path.join(src, "colors.toml"), os.path.join(nxt, "colors.toml"))
+    for fname, text in outputs.items():
+        with open(os.path.join(nxt, fname), "w") as fh:
+            fh.write(text)
+    if os.path.isdir(P.theme_dir):
+        os.rename(P.theme_dir, old)
+    os.rename(nxt, P.theme_dir)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def publish(outputs):
+    """Atomically replace each published file. Returns names published."""
+    done = []
+    atomic_write(os.path.join(P.current, "colors.json"), outputs["colors.json"])
+    done.append("colors.json")
+    for fname, (rel, needs) in PUBLISH.items():
+        if fname not in outputs:
+            continue
+        if needs and not os.path.isdir(P.h(needs)):
+            log("not publishing %s: %s missing" % (fname, needs))
+            continue
+        atomic_write(P.h(rel), outputs[fname])
+        done.append(fname)
+    return done
+
+
+def ensure_btop_conf():
+    path = P.h(".config/btop/btop.conf")
+    text = read_text(path)
+    want = {"color_theme": '"omarchy"', "theme_background": "true"}
+    if text is None:
+        text = "".join("%s = %s\n" % kv for kv in want.items())
+    else:
+        for key, value in want.items():
+            line = "%s = %s" % (key, value)
+            if re.search(r"^%s\s*=.*$" % key, text, flags=re.M):
+                text = re.sub(r"^%s\s*=.*$" % key, line, text, count=1, flags=re.M)
+            else:
+                text = text.rstrip("\n") + "\n" + line + "\n"
+    if read_text(path) != text:
+        atomic_write(path, text)
+
+
+def current_borders():
+    """The [borders] table of settings.toml as a dict ({} if unreadable)."""
+    text = read_text(P.omniwm_settings)
+    if text is None:
+        return {}
+    try:
+        b = tomllib.loads(text).get("borders", {})
+        return b if isinstance(b, dict) else {}
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
+def color_matches(col, want):
+    try:
+        got = [float(col["red"]), float(col["green"]), float(col["blue"]), float(col.get("alpha", 1.0))]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(abs(x - y) < 0.0015 for x, y in zip(got, want))
+
+
+# Theme writes are cosmetic and frequent: keep more backups than the default 5
+# so a few switches do not rotate out the backup of a real settings change.
+OMNIWM_SET_KEEP = "20"
+
+
+def set_omniwm_border(hexv):
+    """borders.color (light appearance) and, when the file has one,
+    borders.darkColor (dark appearance overrides color) both get the theme
+    border, so it follows the theme in either appearance."""
+    r, g, b = rgb_floats(hexv)
+    want = [r, g, b, 1.0]
+    borders = current_borders()
+    tables = ["color"] + (["darkColor"] if isinstance(borders.get("darkColor"), dict) else [])
+    grad = borders.get("gradient")
+    if isinstance(grad, dict) and grad.get("enabled") is True:
+        warn("OmniWM borders.gradient.enabled is true, so the solid theme border colour is not shown")
+    if all(color_matches(borders.get(t), want) for t in tables):
+        log("omniwm border already %s" % hexv)
+        return "unchanged"
+    if not os.access(P.omniwm_set, os.X_OK):
+        warn("omarchy-omniwm-set not found at %s; OmniWM border left as is" % P.omniwm_set)
+        return "skipped"
+    args = [P.omniwm_set, "--keep", OMNIWM_SET_KEEP]
+    if TEST_HOME:
+        # Edit the test home's copy and skip `omniwmctl ping` (the live OmniWM
+        # would not be reading that file anyway).
+        args += ["--file", P.omniwm_settings, "--no-ping"]
+    for t in tables:
+        args += ["borders.%s.red=%s" % (t, r), "borders.%s.green=%s" % (t, g),
+                 "borders.%s.blue=%s" % (t, b), "borders.%s.alpha=1.0" % t]
+    res = run(args, timeout=90, side_effect=False)
+    log("omniwm-set: %s -> %s" % (" ".join(args[1:]), res.returncode if res else "error"))
+    if res is None or res.returncode != 0:
+        warn("omarchy-omniwm-set failed (%s): %s" % (res.returncode if res else "?", (res.stderr or "").strip()[:300] if res else ""))
+        return "failed"
+    return "ok"
+
+
+def set_macos_mode(mode):
+    want_dark = mode != "light"
+    if DRY:
+        log("dry-run skip: macOS dark mode -> %s" % want_dark)
+        return
+    res = run([DEFAULTS, "read", "-g", "AppleInterfaceStyle"], timeout=5, side_effect=False)
+    is_dark = bool(res and res.returncode == 0 and "Dark" in res.stdout)
+    if is_dark == want_dark:
+        return
+    run([OSASCRIPT, "-e", 'tell application "System Events" to tell appearance preferences '
+         'to set dark mode to %s' % ("true" if want_dark else "false")], timeout=10)
+
+
+def reload_apps(published):
+    # Ghostty 1.4 reloads its config on SIGUSR2 ("reloading configuration in response to SIGUSR2").
+    if "ghostty.conf" in published:
+        run([PKILL, "-USR2", "-x", "ghostty"], timeout=5)
+    if "btop.theme" in published:
+        run([PKILL, "-USR2", "-x", "btop"], timeout=5)  # btop re-reads btop.conf + theme
+    if "neovim.lua" in published:
+        run([PKILL, "-USR1", "-x", "nvim"], timeout=5)  # handled by config/omarchy-reload.lua
+    if "omniwm-shell.toml" in published:
+        run([CTL, "shell", "theme", "omarchy"], timeout=10)
+    # Herdr (0.1.11+) live-reloads themes/omarchy.json by itself.
+
+
+# --------------------------------------------------------------------------- themes
+
+
+def themes():
+    try:
+        names = os.listdir(P.themes)
+    except OSError:
+        return []
+    return sorted(d for d in names if os.path.isfile(os.path.join(P.themes, d, "colors.toml")))
+
+
+def normalize_name(name):
+    name = re.sub(r"<[^>]+>", "", name).strip().lower().replace(" ", "-")
+    if not THEME_NAME.match(name):
+        raise ThemeError("invalid theme name %r" % name)
+    return name
+
+
+def current_name():
+    t = read_text(os.path.join(P.current, "theme.name"))
+    return t.strip() if t else None
+
+
+# --------------------------------------------------------------------------- backgrounds
+
+
+def theme_backgrounds(name):
+    d = os.path.join(P.themes, name, "backgrounds")
+    try:
+        files = [os.path.join(d, f) for f in os.listdir(d)
+                 if f.lower().endswith(IMAGE_EXTS) and os.path.isfile(os.path.join(d, f))]
+    except OSError:
+        files = []
+    return sorted(files)
+
+
+def index_file(name):
+    return os.path.join(P.backgrounds, "%s.index" % name)
+
+
+def read_index(name):
+    try:
+        return int((read_text(index_file(name)) or "0").strip())
+    except ValueError:
+        return 0
+
+
+def converted_path(name, src):
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(src))[0])
+    return os.path.join(P.backgrounds, "%s--%s.jpg" % (name, stem))
+
+
+def convert_background(name, src):
+    out = converted_path(name, src)
+    try:
+        if os.path.getmtime(out) >= os.path.getmtime(src) and os.path.getsize(out) > 0:
+            return out
+    except OSError:
+        pass
+    os.makedirs(P.backgrounds, exist_ok=True)
+    tmp = out + ".tmp-%d.jpg" % os.getpid()
+    if src.lower().endswith((".jpg", ".jpeg")):
+        shutil.copyfile(src, tmp)
+    else:
+        res = run([SIPS, "-s", "format", "jpeg", "-s", "formatOptions", "85", src, "--out", tmp],
+                  timeout=90, side_effect=False)
+        if res is None or res.returncode != 0 or not os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise ThemeError("sips could not convert %s: %s" % (src, (res.stderr if res else "").strip()[:200]))
+    os.replace(tmp, out)
+    return out
+
+
+def apply_background(name, index=None, step=0):
+    """Pick background (index state per theme), convert, write current/background."""
+    files = theme_backgrounds(name)
+    if not files:
+        warn("theme %s has no backgrounds" % name)
+        return None
+    if index is None:
+        index = read_index(name) + step
+    index %= len(files)
+    previous = (read_text(os.path.join(P.current, "background")) or "").strip()
+    out = convert_background(name, files[index])
+    atomic_write(index_file(name), "%d\n" % index)
+    atomic_write(os.path.join(P.current, "background"), out + "\n")
+    # Keep the disk small: only this theme's converted images and the one shown until now.
+    for f in glob.glob(os.path.join(P.backgrounds, "*.jpg")):
+        base = os.path.basename(f)
+        if f in (out, previous) or base.startswith(name + "--"):
+            continue
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    return out
+
+
+def touch_theme_name(name):
+    """theme.name is the one file Hammerspoon watches; it is always written last."""
+    atomic_write(os.path.join(P.current, "theme.name"), name + "\n")
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def cmd_set(args):
+    name = normalize_name(args.name)
+    if name not in themes():
+        raise ThemeError("no theme named %s. Try: %s" % (name, ", ".join(themes())))
+    with Lock():
+        previous = current_name()
+        c, outputs = build_theme(name)  # nothing is written before this succeeds
+        stage_and_swap(name, outputs)
+        published = publish(outputs)
+        if os.path.isdir(P.h(".config/btop")) or "btop.theme" in published:
+            ensure_btop_conf()
+        border = set_omniwm_border(c["_border"])
+        reload_apps(published)
+        set_macos_mode(c["mode"])
+        try:
+            bg = apply_background(name, step=1 if previous == name else 0)
+        except ThemeError as exc:
+            warn(str(exc))
+            bg = None
+        touch_theme_name(name)
+    log("set %s (%s) published=%s border=%s background=%s warnings=%d"
+        % (name, c["mode"], ",".join(published), border, bg, len(WARNINGS)))
+    print(name)
+
+
+def cmd_bg(args, step=0, index=None):
+    name = current_name()
+    if not name:
+        raise ThemeError("no theme set yet")
+    with Lock():
+        bg = apply_background(name, index=index, step=step)
+        touch_theme_name(name)
+    log("background %s -> %s" % (name, bg))
+    if bg:
+        print(bg)
+
+
+def cmd_bg_set(args):
+    name = current_name()
+    if not name:
+        raise ThemeError("no theme set yet")
+    files = theme_backgrounds(name)
+    target = args.background
+    if target.isdigit():
+        idx = int(target)
+    else:
+        real = os.path.realpath(os.path.expanduser(target))
+        matches = [i for i, f in enumerate(files) if os.path.realpath(f) == real
+                   or os.path.realpath(converted_path(name, f)) == real]
+        if not matches:
+            raise ThemeError("%s is not a background of %s (see bg-list)" % (target, name))
+        idx = matches[0]
+    if not 0 <= idx < len(files):
+        raise ThemeError("index %d out of range (theme %s has %d backgrounds)" % (idx, name, len(files)))
+    cmd_bg(args, index=idx)
+
+
+def cmd_bg_list(args):
+    name = current_name()
+    files = theme_backgrounds(name) if name else []
+    cur = read_index(name) % len(files) if files else -1
+    if args.json:
+        print(json.dumps([{"index": i, "path": f, "current": i == cur} for i, f in enumerate(files)], indent=2))
+    else:
+        for f in files:
+            print(f)
+
+
+def cmd_list(args):
+    names = themes()
+    if not args.json:
+        print("\n".join(names))
+        return
+    cur = current_name()
+    out = []
+    for n in names:
+        entry = {"name": n, "title": title_of(n), "current": n == cur}
+        try:
+            c = resolve_colors(os.path.join(P.themes, n))
+            entry.update(mode=c["mode"], accent=c["accent"], background=c["background"], foreground=c["foreground"])
+        except ThemeError as exc:
+            entry["error"] = str(exc)
+        prev = os.path.join(P.themes, n, "preview.png")
+        entry["preview"] = prev if os.path.isfile(prev) else None
+        out.append(entry)
+    print(json.dumps(out, indent=2))
+
+
+def cmd_current(args):
+    print(current_name() or "")
+
+
+def cmd_check(args):
+    names = [normalize_name(n) for n in args.names] or themes()
+    failed = 0
+    for n in names:
+        try:
+            c, outputs = build_theme(n)
+            print("ok   %-18s %-5s border=%s outputs=%s" % (n, c["mode"], c["_border"], ",".join(sorted(outputs))))
+        except ThemeError as exc:
+            failed += 1
+            print("FAIL %-18s %s" % (n, exc))
+    sys.exit(1 if failed else 0)
+
+
+def main(argv=None):
+    global P, DRY, TEST_HOME
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dry-run", action="store_true",
+                        help="only with HOME set to a test home (implied there): write files under "
+                             "that HOME, send no signals, run no osascript/omniwmctl")
+    ap = argparse.ArgumentParser(prog="omarchy-theme", parents=[common],
+                                 description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", metavar="<command>")
+    s = sub.add_parser("set", parents=[common], help="switch everything to a theme")
+    s.add_argument("name", help='theme folder name, e.g. tokyo-night or "Tokyo Night"')
+    sub.add_parser("bg-next", parents=[common], help="next background of the current theme")
+    b = sub.add_parser("bg-set", parents=[common], help="pick a background of the current theme")
+    b.add_argument("background", help="index (see bg-list) or path of a background")
+    bl = sub.add_parser("bg-list", parents=[common], help="list the current theme's backgrounds")
+    bl.add_argument("--json", action="store_true")
+    li = sub.add_parser("list", parents=[common], help="list themes")
+    li.add_argument("--json", action="store_true", help="name, title, mode, colours, preview path")
+    sub.add_parser("current", parents=[common], help="print the current theme name")
+    ch = sub.add_parser("check", parents=[common], help="resolve + render themes without writing")
+    ch.add_argument("names", nargs="*")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # --dry-run is accepted anywhere (argparse subparser defaults would reset it).
+    DRY = "--dry-run" in argv or os.environ.get("OMARCHY_THEME_DRY_RUN") == "1"
+    argv = [a for a in argv if a != "--dry-run"]
+    args = ap.parse_args(argv)
+    P = Paths()
+    if not args.cmd:
+        ap.print_help()
+        return 2
+    # OMARCHY_THEME_TREAT_AS_REAL_HOME (test harness only) can make a test home
+    # count as real, to exercise the refusal below; it can never make the real
+    # home count as a test home.
+    real_homes = {os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)}
+    if os.environ.get("OMARCHY_THEME_TREAT_AS_REAL_HOME"):
+        real_homes.add(os.path.realpath(os.environ["OMARCHY_THEME_TREAT_AS_REAL_HOME"]))
+    TEST_HOME = os.path.realpath(P.home) not in real_homes
+    if DRY and not TEST_HOME and args.cmd in ("set", "bg-next", "bg-set"):
+        print("omarchy-theme: --dry-run needs HOME pointing at a test home (%s is the real one, and %s "
+              "always writes files there); use `omarchy-theme check` for a no-write preview"
+              % (P.home, args.cmd), file=sys.stderr)
+        return 2
+    if TEST_HOME and not DRY:
+        DRY = True
+        if args.cmd in ("set", "bg-next", "bg-set"):
+            print("omarchy-theme: HOME=%s is not the login home; running as --dry-run" % P.home, file=sys.stderr)
+    handlers = {
+        "set": cmd_set, "bg-next": lambda a: cmd_bg(a, step=1), "bg-set": cmd_bg_set,
+        "bg-list": cmd_bg_list, "list": cmd_list, "current": cmd_current, "check": cmd_check,
+    }
+    try:
+        handlers[args.cmd](args)
+    except ThemeError as exc:
+        log("error: %s %s" % (args.cmd, exc))
+        print("omarchy-theme: %s" % exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

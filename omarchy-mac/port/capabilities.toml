@@ -1,0 +1,109 @@
+# Linux/Quickshell capability -> macOS equivalent used by omarchy-port.
+# match   = regexes looked for in a plugin's QML/scripts (imports, commands, identifiers)
+# mac     = what to use instead on this Mac
+# support = full | partial | none
+
+[hyprland]
+match = ["Quickshell.Hyprland", "hyprctl", "Hyprland\\.", "omarchy-hyprland-"]
+mac = "omniwmctl (workspaces, windows, focus, layout); `omniwmctl query ...` / `subscribe` for state"
+support = "partial"
+
+[pipewire_audio]
+match = ["Quickshell.Services.Pipewire", "wpctl", "pactl", "pamixer", "Pipewire"]
+mac = "hs.audiodevice (default output/input, volume, mute, device list, watcher); OmniShell lib/audio.luau for display"
+support = "full"
+
+[network]
+match = ["nmcli", "NetworkManager", "iwctl", "impala", "Networking"]
+mac = "hs.wifi (scan/associate/power) + /usr/sbin/networksetup; see ~/.hammerspoon/omarchy/netpanel.lua"
+support = "full"
+
+[bluetooth]
+match = ["bluetoothctl", "Quickshell.Bluetooth", "Bluetooth\\.", "bluetui"]
+mac = "/opt/homebrew/bin/blueutil (power, paired, connect); see netpanel.lua"
+support = "full"
+
+[upower_battery]
+match = ["Quickshell.Services.UPower", "upower", "UPower"]
+mac = "hs.battery (percentage, charging, time remaining, watcher); OmniShell lib/battery.luau"
+support = "full"
+
+[power_profiles]
+match = ["powerprofilesctl", "PowerProfiles"]
+mac = "macOS Low Power Mode: `pmset -g` read-only (setting needs sudo) -> show state, open Battery settings"
+support = "partial"
+
+[brightness]
+match = ["brightnessctl", "ddcutil", "backlight"]
+mac = "hs.brightness (built-in display); external displays via BetterDisplay if installed (betterdisplaycli)"
+support = "partial"
+
+[mpris_media]
+match = ["Quickshell.Services.Mpris", "playerctl", "Mpris"]
+mac = "hs.spotify / hs.itunes, plus OmniShell lib/media.luau (system now-playing data)"
+support = "partial"
+
+[notifications]
+match = ["Quickshell.Services.Notifications", "NotificationServer", "notify-send", "makoctl"]
+mac = "Reading other apps' notifications needs Full Disk Access (forbidden). Posting: hs.notify. Show Notification Center / Do Not Disturb via shortcuts."
+support = "partial"
+
+[clipboard]
+match = ["wl-copy", "wl-paste", "cliphist", "Clipboard"]
+mac = "hs.pasteboard + hs.pasteboard.watcher (in-memory history only; skip when Citrix Viewer or a password manager is frontmost); Maccy is already installed"
+support = "full"
+
+[tray]
+match = ["Quickshell.Services.SystemTray", "SystemTray"]
+mac = "already ported: omarchy-tray widget + ~/.hammerspoon/omarchy/tray.lua"
+support = "full"
+
+[idle_lock]
+match = ["hypridle", "IdleInhibitor", "IdleMonitor", "loginctl lock"]
+mac = "hs.caffeinate (prevent idle sleep, lockScreen, startScreensaver); hs.caffeinate.watcher"
+support = "full"
+
+[session_lock]
+match = ["WlSessionLock", "pam", "Pam"]
+mac = "none: macOS lock screen cannot be replaced; use hs.caffeinate.lockScreen()"
+support = "none"
+
+[polkit]
+match = ["Quickshell.Services.Polkit", "PolkitAgent", "polkit"]
+mac = "none: macOS shows its own authentication dialogs"
+support = "none"
+
+[nightlight]
+match = ["hyprsunset", "gammastep", "wlsunset", "nightlight"]
+mac = "macOS Night Shift: /opt/homebrew/bin/nightlight (brew 'smudge/smudge/nightlight') if installed, else open Displays settings"
+support = "partial"
+
+[layer_shell_overlay]
+match = ["WlrLayershell", "PanelWindow", "FloatingWindow", "LazyLoader"]
+mac = "hs.webview (borderless, allowTextEntry, modalPanel level) or hs.canvas for non-interactive overlays; see picker.lua"
+support = "full"
+
+[apps_desktop_entries]
+match = ["DesktopEntries", "\\.desktop", "gtk-launch", "uwsm"]
+mac = "hs.application / /usr/bin/open -b <bundle>; app icons via OmniShell ui.icon{ app = bundleID }"
+support = "full"
+
+[weather_http]
+match = ["wttr.in", "open-meteo", "curl "]
+mac = "OmniShell weather data (ctx.data) or hs.http.asyncGet"
+support = "full"
+
+[tailscale]
+match = ["tailscale "]
+mac = "/Applications/Tailscale.app/Contents/MacOS/Tailscale (CLI) status --json / up / down"
+support = "full"
+
+[system_stats]
+match = ["/proc/", "btop", "sensors", "SystemStats"]
+mac = "OmniShell lib/stats.luau (ctx.data stats) or hs.host.cpuUsage / vmStat"
+support = "full"
+
+[dock]
+match = ["omarchy.dock", "Dock\\.qml"]
+mac = "macOS Dock exists; at most an app grid overlay (hs.webview) launching via open -b"
+support = "partial"

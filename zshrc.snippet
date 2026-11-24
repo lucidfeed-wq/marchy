@@ -1,0 +1,56 @@
+# >>> omarchy-mac shell >>>
+# Omarchy 4.5 shell niceties (default/bash/envs + aliases), adapted for zsh on
+# macOS. Append at the END of ~/.zshrc: the cd -> zoxide alias needs the
+# `zoxide init zsh` line above it. Existing lines (ls/lsa/lt/lta, ff, n, lg, bt)
+# are already there and are not repeated.
+
+# Editor and pagers
+export EDITOR="${EDITOR:-nvim}"
+export VISUAL="${VISUAL:-$EDITOR}"
+export SUDO_EDITOR="$EDITOR"
+export BAT_THEME=ansi                      # bat follows the Omarchy terminal palette
+if command -v bat >/dev/null; then
+  export MANROFFOPT="-c"
+  export MANPAGER="sh -c 'col -bx | bat -l man -p'"
+fi
+
+# Directories
+alias ..='cd ..'
+alias ...='cd ../..'
+alias ....='cd ../../..'
+
+# Open a file picked with ff (fzf + bat preview) in $EDITOR
+alias eff='$EDITOR "$(ff)"'
+
+# Git
+alias g='git'
+alias gcm='git commit -m'
+alias gcam='git commit -a -m'
+alias gcad='git commit -a --amend'
+
+# Tools, only when installed
+command -v docker >/dev/null && alias d='docker'
+command -v tmux >/dev/null && alias t='tmux attach || tmux new -s Work'
+command -v mise >/dev/null && alias mup='MISE_MINIMUM_RELEASE_AGE=0 mise up'
+
+# cd goes through zoxide like Omarchy: a real directory is entered directly,
+# anything else is looked up with `z` (several words = zoxide keywords).
+# Options (cd -P dir, cd -, cd -2) and zsh's `cd old new` (old is part of $PWD)
+# stay with the builtin. Delete these lines to keep plain cd.
+if command -v zoxide >/dev/null && typeset -f z >/dev/null; then
+  zd() {
+    if (( $# == 0 )); then
+      builtin cd ~ || return
+    elif [[ -d $1 || $1 == -* ]] || { (( $# == 2 )) && [[ $PWD == *"$1"* ]]; }; then
+      builtin cd "$@" || return
+    else
+      z "$@" || { echo "Error: Directory not found"; return 1; }
+      printf '\363\261\236\251 '   # U+F17A9 as UTF-8 bytes (works without a UTF-8 locale)
+      pwd
+    fi
+  }
+  alias cd='zd'
+  # Complete zd like cd (complete_aliases is off, so `cd <Tab>` completes zd).
+  (( $+functions[compdef] )) && compdef zd=cd
+fi
+# <<< omarchy-mac shell <<<

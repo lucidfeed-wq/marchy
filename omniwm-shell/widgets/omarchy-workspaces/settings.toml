@@ -1,0 +1,74 @@
+# Options for the omarchy-workspaces bar widget (values arrive in
+# ctx.data.settings; override in shell.toml under
+# [profiles.default.widgets.omarchy-workspaces]).
+
+[options.alwaysShow]
+type = "number"
+title = "Workspaces always listed (later ones only when occupied or focused)"
+default = 5
+min = 0
+max = 20
+step = 1
+
+[options.showAll]
+type = "boolean"
+title = "List every workspace on this display"
+default = false
+
+[options.activeStyle]
+type = "choice"
+title = "Focused workspace shows"
+default = "number"
+choices = ["number", "glyph"]
+
+[options.activeColor]
+type = "string"
+title = "Focused workspace color (palette role or #RRGGBB)"
+default = "accent"
+maxLength = 32
+
+[options.activeBold]
+type = "boolean"
+title = "Bold focused workspace"
+default = true
+
+[options.textColor]
+type = "string"
+title = "Workspace label color (palette role or #RRGGBB)"
+default = "foreground"
+maxLength = 32
+
+[options.emptyOpacity]
+type = "number"
+title = "Opacity of empty workspaces"
+default = 0.5
+min = 0.1
+max = 1
+step = 0.05
+
+[options.font]
+type = "string"
+title = "Font family (or system)"
+default = "JetBrainsMono Nerd Font"
+maxLength = 64
+
+[options.size]
+type = "number"
+title = "Text size (points)"
+default = 12
+min = 8
+max = 20
+step = 1
+
+[options.minWidth]
+type = "number"
+title = "Minimum label width (points)"
+default = 20
+min = 12
+max = 48
+step = 1
+
+[options.invertScroll]
+type = "boolean"
+title = "Invert scroll direction"
+default = false

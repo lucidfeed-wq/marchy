@@ -1,0 +1,451 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tomlkit>=0.13"]
+# ///
+"""omarchy-omniwm-set: the only writer of OmniWM's settings.toml.
+
+Usage:
+  omarchy-omniwm-set [options] PATH=VALUE [PATH=VALUE ...]
+  omarchy-omniwm-set [options] --get PATH
+  omarchy-omniwm-set [options] --delete PATH [--delete PATH ...]
+  omarchy-omniwm-set [options] --toggle PATH=ON,OFF [--toggle PATH=ON,OFF ...]
+  omarchy-omniwm-set [options] --install FILE [--force]
+
+PATH grammar (dotted, with array-of-tables addressing):
+  gaps.size
+  gaps.outer.top
+  workspaces[name=1].layoutType          first table in [[workspaces]] whose name == "1"
+  launcher.entries[id=A1B2...].name      selector compares str(value)
+  hotkeys[0].binding                     plain index into an array
+
+VALUE is parsed as a TOML value (true, 5, 5.0, "text", [1, 2]); anything that
+is not valid TOML is taken as a bare string (so  mode=dark  works). If the key
+already holds a float and VALUE is an integer, the float type is kept.
+
+--toggle flips a group of keys in one locked read-modify-write: if the FIRST
+toggle's PATH currently equals its OFF value, every PATH is set to its ON
+value; otherwise every PATH is set to its OFF value. Example (gaps on/off):
+  --toggle gaps.size=5,0 --toggle gaps.outer.top=10,0 ...
+
+--install FILE replaces the whole file with FILE. FILE must be a snapshot of
+the CURRENT live file: when FILE.source-sha256 exists (omarchy-keys generate
+writes it) its hash must match the live file, otherwise the install is refused
+(OmniWM writes some keys itself; installing a stale snapshot would revert
+them). Without that sidecar --install is refused unless --force is given.
+Prefer 'omarchy-keys install --only settings', which re-merges under the lock.
+
+Options:
+  --file PATH     settings file (default ~/.config/omniwm/settings.toml)
+  --force         --install: skip the snapshot (source-sha256) check
+  --dry-run       print the resulting diff, write nothing
+  --no-ping       skip the post-write 'omniwmctl ping' / corrupt-file check
+  --keep N        backups to keep (default 5)
+  -q, --quiet     less output
+  -h, --help      this help
+
+Safety: takes an flock on ~/.local/state/omarchy-mac/omniwm.lock, writes a
+timestamped backup (<file>.bak.omarchy-set.<stamp>, newest 5 kept), writes a
+temp file in the same directory and renames it into place (atomic), preserves
+key order and comments via tomlkit, then runs 'omniwmctl ping' and checks that
+OmniWM did not produce a new settings.toml.corrupt* file (restores the backup
+if it did). Edits that leave the file unchanged write nothing.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import difflib
+import fcntl
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import tomlkit
+from tomlkit.items import AoT, Array, Table, InlineTable
+
+OMNIWMCTL = "/Applications/OmniWM.app/Contents/MacOS/omniwmctl"
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+DEFAULT_FILE = HOME / ".config/omniwm/settings.toml"
+STATE_DIR = HOME / ".local/state/omarchy-mac"
+LOCK_FILE = STATE_DIR / "omniwm.lock"
+LOG_FILE = STATE_DIR / "omniwm-set.log"
+BACKUP_TAG = ".bak.omarchy-set."
+
+
+class PathError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------- path grammar
+_SEG_RE = re.compile(r"^(?P<name>[A-Za-z0-9_\-]+)(?:\[(?P<sel>[^\]]+)\])?$")
+
+
+def split_path(path: str) -> list[tuple[str, str | None]]:
+    """Split 'a.b[k=v].c' into [(a,None),(b,'k=v'),(c,None)].
+
+    Dots inside [...] are not separators (selector values may contain dots).
+    """
+    segs, buf, depth = [], "", 0
+    for ch in path:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        if ch == "." and depth == 0:
+            segs.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    segs.append(buf)
+    out = []
+    for s in segs:
+        m = _SEG_RE.match(s)
+        if not m:
+            raise PathError(f"bad path segment {s!r} in {path!r}")
+        out.append((m.group("name"), m.group("sel")))
+    return out
+
+
+def _select(container, sel: str, where: str):
+    """Return (index, item) in an AoT/array for selector 'k=v' or 'N'."""
+    if not isinstance(container, (AoT, Array, list)):
+        raise PathError(f"{where} is not an array, cannot apply [{sel}]")
+    if re.fullmatch(r"-?\d+", sel):
+        i = int(sel)
+        try:
+            return i, container[i]
+        except IndexError:
+            raise PathError(f"{where}[{sel}] out of range") from None
+    if "=" not in sel:
+        raise PathError(f"selector [{sel}] must be N or key=value")
+    k, v = sel.split("=", 1)
+    for i, item in enumerate(container):
+        if isinstance(item, (Table, InlineTable, dict)) and k in item and str(item[k]) == v:
+            return i, item
+    raise PathError(f"no element of {where} with {k} == {v!r}")
+
+
+def resolve(doc, path: str, create: bool = False):
+    """Return (parent, key_or_index) for the last segment of path."""
+    segs = split_path(path)
+    node = doc
+    where = ""
+    for n, (name, sel) in enumerate(segs):
+        last = n == len(segs) - 1
+        where = f"{where}.{name}" if where else name
+        if last and sel is None:
+            if not isinstance(node, (Table, InlineTable, dict)) and node is not doc:
+                raise PathError(f"{where}: parent is not a table")
+            return node, name
+        if name not in node:
+            if create and sel is None:
+                node[name] = tomlkit.table()
+            else:
+                raise PathError(f"{where} does not exist")
+        child = node[name]
+        if sel is not None:
+            idx, item = _select(child, sel, where)
+            where = f"{where}[{sel}]"
+            if last:
+                return child, idx
+            node = item
+        else:
+            node = child
+    raise PathError(f"empty path {path!r}")  # pragma: no cover
+
+
+def get_value(doc, path: str):
+    parent, key = resolve(doc, path)
+    try:
+        return parent[key]
+    except (KeyError, IndexError):
+        raise PathError(f"{path} does not exist") from None
+
+
+def parse_value(raw: str):
+    try:
+        return tomlkit.parse(f"v = {raw}")["v"]
+    except Exception:
+        return raw
+
+
+def _plain(v):
+    return v.unwrap() if hasattr(v, "unwrap") else v
+
+
+def set_value(doc, path: str, raw_or_value, *, parsed: bool = False) -> bool:
+    """Set path to value. Returns True when the value changed."""
+    value = raw_or_value if parsed else parse_value(raw_or_value)
+    parent, key = resolve(doc, path, create=False)
+    old = None
+    exists = True
+    try:
+        old = parent[key]
+    except (KeyError, IndexError):
+        exists = False
+    if not exists and isinstance(key, str):
+        # Only allow creating a *new key* inside an existing table.
+        parent[key] = value
+        return True
+    pv = _plain(value)
+    if exists:
+        po = _plain(old)
+        if isinstance(po, float) and isinstance(pv, int) and not isinstance(pv, bool):
+            value = float(pv)
+            pv = value
+        if type(po) is type(pv) and po == pv:
+            return False
+        if isinstance(po, bool) != isinstance(pv, bool) or (
+            not isinstance(po, bool) and type(po) is not type(pv)
+            and not (isinstance(po, (int, float)) and isinstance(pv, (int, float)))
+        ):
+            raise PathError(f"{path}: type change {type(po).__name__} -> {type(pv).__name__} refused")
+    parent[key] = value
+    return True
+
+
+def apply_toggles(doc, specs: list[str]) -> str:
+    """Apply a --toggle group. Returns 'on' or 'off' (the state written)."""
+    parsed = []
+    for s in specs:
+        path, sep, vals = s.rpartition("=")
+        if not sep or not path or "," not in vals:
+            raise PathError(f"--toggle expects PATH=ON,OFF, got {s!r}")
+        on, off = (parse_value(v.strip()) for v in vals.split(",", 1))
+        parsed.append((path, on, off))
+    first_path, _on, first_off = parsed[0]
+    cur = _plain(get_value(doc, first_path))
+    off = _plain(first_off)
+    is_off = (cur == off and isinstance(cur, bool) == isinstance(off, bool))
+    state = "on" if is_off else "off"
+    for path, on, off in parsed:
+        set_value(doc, path, on if is_off else off, parsed=True)
+    return state
+
+
+def delete_path(doc, path: str) -> bool:
+    parent, key = resolve(doc, path)
+    try:
+        del parent[key]
+    except (KeyError, IndexError):
+        raise PathError(f"{path} does not exist") from None
+    return True
+
+
+# --------------------------------------------------------------------------- file ops
+def log(msg: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{_dt.datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except OSError:
+        pass
+
+
+def backup(target: Path, keep: int) -> Path:
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    dst = target.with_name(target.name + BACKUP_TAG + stamp)
+    dst.write_bytes(target.read_bytes())
+    olds = sorted(target.parent.glob(target.name + BACKUP_TAG + "*"))
+    for p in olds[:-keep] if keep > 0 else olds:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    return dst
+
+
+def atomic_write(target: Path, text: str) -> None:
+    mode = target.stat().st_mode & 0o777 if target.exists() else 0o644
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def corrupt_files(d: Path) -> set[str]:
+    return {p.name for p in d.glob("settings.toml.corrupt*")}
+
+
+def post_check(target: Path, before: set[str], bak: Path, quiet: bool) -> int:
+    time.sleep(0.7)
+    after = corrupt_files(target.parent)
+    if after - before:
+        target.write_bytes(bak.read_bytes())
+        print(f"omarchy-omniwm-set: OmniWM rejected the file ({', '.join(sorted(after - before))}); restored {bak.name}",
+              file=sys.stderr)
+        log(f"REJECTED {target} restored {bak}")
+        return 3
+    if os.path.exists(OMNIWMCTL):
+        r = subprocess.run([OMNIWMCTL, "ping"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            print("omarchy-omniwm-set: warning: 'omniwmctl ping' failed (OmniWM not running?)", file=sys.stderr)
+        elif not quiet:
+            print("omniwmctl ping: ok")
+    return 0
+
+
+class Locked:
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.fh = open(LOCK_FILE, "a+")
+        deadline = time.time() + 10
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.time() > deadline:
+                    raise SystemExit("omarchy-omniwm-set: timed out waiting for the settings lock")
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="omarchy-omniwm-set", description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n", 1)[1])
+    ap.add_argument("assign", nargs="*", metavar="PATH=VALUE")
+    ap.add_argument("--file", type=Path, default=DEFAULT_FILE)
+    ap.add_argument("--get", metavar="PATH")
+    ap.add_argument("--delete", action="append", default=[], metavar="PATH")
+    ap.add_argument("--toggle", action="append", default=[], metavar="PATH=ON,OFF")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--install", type=Path, metavar="FILE",
+                    help="replace the settings file with FILE (validated TOML, same schemaVersion)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-ping", action="store_true")
+    ap.add_argument("--keep", type=int, default=5)
+    ap.add_argument("-q", "--quiet", action="store_true")
+    a = ap.parse_args(argv)
+
+    target: Path = a.file.expanduser()
+    if not target.exists():
+        print(f"omarchy-omniwm-set: {target} does not exist", file=sys.stderr)
+        return 2
+
+    if a.get:
+        doc = tomlkit.parse(target.read_text(encoding="utf-8"))
+        try:
+            v = get_value(doc, a.get)
+        except PathError as e:
+            print(f"omarchy-omniwm-set: {e}", file=sys.stderr)
+            return 1
+        pv = _plain(v)
+        if isinstance(pv, bool):
+            print("true" if pv else "false")
+        elif isinstance(pv, (int, float, str)):
+            print(pv)
+        else:
+            print(tomlkit.dumps({"v": v}).split("=", 1)[1].strip() if not isinstance(v, (Table, AoT)) else tomlkit.dumps(v))
+        return 0
+
+    if not (a.assign or a.delete or a.install or a.toggle):
+        ap.print_usage(sys.stderr)
+        return 2
+
+    toggled = None
+    with Locked():
+        old_text = target.read_text(encoding="utf-8")
+        if a.install:
+            if a.assign or a.delete or a.toggle:
+                print("omarchy-omniwm-set: --install cannot be combined with edits", file=sys.stderr)
+                return 2
+            side = a.install.expanduser().with_name(a.install.name + ".source-sha256")
+            live_sha = hashlib.sha256(old_text.encode("utf-8")).hexdigest()
+            if side.exists():
+                want = side.read_text(encoding="utf-8").split()[0] if side.read_text().strip() else ""
+                if want != live_sha and not a.force:
+                    print(f"omarchy-omniwm-set: {target} changed since {a.install} was generated "
+                          f"(sha256 {live_sha[:12]} != {want[:12]}); regenerate it, or use "
+                          "'omarchy-keys install --only settings' (or --force to overwrite)", file=sys.stderr)
+                    return 4
+            elif not a.force:
+                print(f"omarchy-omniwm-set: {side} not found, cannot prove {a.install} is a snapshot of the "
+                      f"current {target}; use 'omarchy-keys install --only settings' (or --force)", file=sys.stderr)
+                return 4
+            new_text = a.install.expanduser().read_text(encoding="utf-8")
+            try:
+                new_doc = tomlkit.parse(new_text)
+            except Exception as e:
+                print(f"omarchy-omniwm-set: {a.install} is not valid TOML: {e}", file=sys.stderr)
+                return 1
+            old_ver = tomlkit.parse(old_text).get("schemaVersion")
+            if new_doc.get("schemaVersion") != old_ver:
+                print(f"omarchy-omniwm-set: schemaVersion mismatch ({new_doc.get('schemaVersion')} vs {old_ver})",
+                      file=sys.stderr)
+                return 1
+        else:
+            doc = tomlkit.parse(old_text)
+            try:
+                for p in a.delete:
+                    delete_path(doc, p)
+                for item in a.assign:
+                    if "=" not in item:
+                        raise PathError(f"expected PATH=VALUE, got {item!r}")
+                    # split on the first '=' that is outside [...]
+                    depth, cut = 0, -1
+                    for i, ch in enumerate(item):
+                        if ch == "[":
+                            depth += 1
+                        elif ch == "]":
+                            depth -= 1
+                        elif ch == "=" and depth == 0:
+                            cut = i
+                            break
+                    if cut < 0:
+                        raise PathError(f"expected PATH=VALUE, got {item!r}")
+                    set_value(doc, item[:cut], item[cut + 1:])
+                if a.toggle:
+                    toggled = apply_toggles(doc, a.toggle)
+            except PathError as e:
+                print(f"omarchy-omniwm-set: {e}", file=sys.stderr)
+                return 1
+            new_text = tomlkit.dumps(doc)
+            tomlkit.parse(new_text)  # sanity: still parses
+
+        if toggled and not a.quiet:
+            print(f"omarchy-omniwm-set: toggled {toggled}")
+        if new_text == old_text:
+            if not a.quiet:
+                print("omarchy-omniwm-set: no change")
+            return 0
+
+        if a.dry_run:
+            sys.stdout.writelines(difflib.unified_diff(
+                old_text.splitlines(True), new_text.splitlines(True), str(target), str(target) + " (new)"))
+            return 0
+
+        before = corrupt_files(target.parent)
+        bak = backup(target, a.keep)
+        atomic_write(target, new_text)
+        log(f"WROTE {target} ({' '.join(a.assign + ['--delete ' + d for d in a.delete] + ['--toggle ' + x for x in a.toggle]) or '--install ' + str(a.install)})"
+            f" backup={bak.name}")
+        if not a.quiet:
+            print(f"omarchy-omniwm-set: wrote {target} (backup {bak.name})")
+        if a.no_ping:
+            return 0
+        return post_check(target, before, bak, a.quiet)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

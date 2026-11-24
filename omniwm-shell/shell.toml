@@ -1,0 +1,51 @@
+profile = "default"
+
+[profiles]
+
+# Omarchy 4.5 top bar: Omarchy logo (menu) and workspace numbers on the left,
+# "dddd HH:mm" clock in the centre, status icons on the right. 26 pt, full
+# width, opaque `background` fill from themes/omarchy.toml (rewritten by
+# `omarchy-theme set <name>`), no item backgrounds, no border or rounding.
+# The three omarchy-* widgets live in ~/.config/omniwm/shell/widgets/.
+[profiles.default]
+theme = "omarchy"
+leading = ["omarchy-logo", "omarchy-workspaces", "app-menu"]
+center = ["omarchy-clock"]
+# omarchy-tray mirrors the macOS menu-bar extras (Tailscale, Sync, Maccy, ...)
+# into this bar: Hammerspoon reads them via Accessibility and clicking one opens
+# the real app menu. The macOS menu bar itself is auto-hidden by this full-width
+# bar; app-menu (after the workspaces) keeps File/Edit menus reachable.
+trailing = ["omarchy-tray", "omarchy-bluetooth", "omarchy-wifi", "volume", "battery"]
+
+[profiles.default.workspaceBar]
+position = "overlappingMenuBar"
+height = 26
+fullWidth = true
+reserveLayoutSpace = true
+transparentBackground = false
+solidBlackBackground = false
+backgroundOpacity = 1
+barFill = "background"
+showItemBackgrounds = false
+showAccentHighlights = false
+showLabels = true
+systemStatsButton = false
+
+[profiles.default.widgets.omarchy-logo]
+color = "accent"
+size = 12
+
+[profiles.default.widgets.omarchy-workspaces]
+alwaysShow = 5
+activeStyle = "number"
+activeColor = "accent"
+emptyOpacity = 0.5
+
+[profiles.default.widgets.omarchy-clock]
+format = "weekday-24h"
+
+# Fallback for the bundled `workspaces` widget if omarchy-workspaces is ever
+# swapped back into `leading`.
+[profiles.default.widgets.workspaces]
+indicator = "minimal"
+compact = true

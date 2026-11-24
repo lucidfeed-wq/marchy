@@ -1,0 +1,1607 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""omarchy-doctor: verify the Omarchy-on-macOS stack (OmniWM + Hammerspoon + Karabiner).
+
+Modes
+  --static        read-only checks, no visible effect (default when no mode given)
+  --interactive   guided test of the real key path (you press keys, the doctor watches
+                  OmniWM state); restores the original workspace at the end
+  --secure-input  like --interactive's workspace tests, but with Secure Event Input
+                  enabled in this process (always disabled again on exit)
+
+Exit code: 0 = no FAIL, 1 = at least one FAIL, 2 = usage error.
+With --strict, WARN also yields exit 1.
+
+Privacy: the doctor never queries window titles, never captures the screen and never
+sends keystrokes. Window queries use --fields id,app only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import datetime as _dt
+import json
+import os
+import plistlib
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+OMNIWMCTL = "/Applications/OmniWM.app/Contents/MacOS/omniwmctl"
+OPEN = "/usr/bin/open"
+KARABINER_CLI = "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
+KARABINER_CLI_BETA = "/Applications/Karabiner-Elements.app/Contents/Helpers/karabiner_cli"
+GHOSTTY = "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+GHOSTTY_BUNDLE = "com.mitchellh.ghostty"
+CITRIX_BUNDLE = "com.citrix.receiver.icaviewer.mac"
+STATE_DIR = HOME / ".local/state/omarchy-mac"
+OM_DIR = HOME / ".config/omarchy-mac"
+
+# HID usage page 7 key codes as hidutil reports them (0x7000000xx)
+HID_CAPS = 0x700000039
+HID_F18 = 0x70000006D
+
+# CGEventFlags (device-independent)
+FLAG_SHIFT = 0x00020000
+FLAG_CTRL = 0x00040000
+FLAG_ALT = 0x00080000
+FLAG_CMD = 0x00100000
+SUPER_FLAGS = FLAG_CTRL | FLAG_ALT | FLAG_CMD
+
+# Key names -> Karabiner key_code (for the "bound chord is swallowed" check).
+_PUNCT = {"minus": "hyphen", "equal": "equal_sign", "grave": "grave_accent_and_tilde", "comma": "comma",
+          "period": "period", "slash": "slash", "backslash": "backslash", "left bracket": "open_bracket",
+          "right bracket": "close_bracket", "semicolon": "semicolon", "quote": "quote"}
+OMNI_KEY_TO_KB = {**{c.lower(): c.lower() for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}, **{d: d for d in "0123456789"},
+                  **{f"f{i}": f"f{i}" for i in range(1, 21)}, **_PUNCT,
+                  "return": "return_or_enter", "space": "spacebar", "tab": "tab", "escape": "escape",
+                  "delete": "delete_or_backspace", "forward delete": "delete_forward",
+                  "left arrow": "left_arrow", "right arrow": "right_arrow", "up arrow": "up_arrow",
+                  "down arrow": "down_arrow", "home": "home", "end": "end", "page up": "page_up",
+                  "page down": "page_down"}
+HS_KEY_TO_KB = {**{c.lower(): c.lower() for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}, **{d: d for d in "0123456789"},
+                **{f"f{i}": f"f{i}" for i in range(1, 21)},
+                "return": "return_or_enter", "space": "spacebar", "tab": "tab", "escape": "escape",
+                "delete": "delete_or_backspace", "forwarddelete": "delete_forward", "left": "left_arrow",
+                "right": "right_arrow", "up": "up_arrow", "down": "down_arrow", "-": "hyphen", "=": "equal_sign",
+                "`": "grave_accent_and_tilde", ",": "comma", ".": "period", "/": "slash", "\\": "backslash",
+                "[": "open_bracket", "]": "close_bracket", ";": "semicolon", "'": "quote", "home": "home",
+                "end": "end", "pageup": "page_up", "pagedown": "page_down"}
+# What Karabiner sees while Caps (Super) is held: the modifiers the Caps rule emits.
+SUPER_HELD = ("right_command", "right_option", "right_control")
+
+# --------------------------------------------------------------------------- output
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+C = {
+    "PASS": "\033[32m", "WARN": "\033[33m", "FAIL": "\033[31m", "INFO": "\033[36m",
+    "SKIP": "\033[90m", "bold": "\033[1m", "reset": "\033[0m",
+}
+
+
+def col(kind: str, text: str) -> str:
+    return f"{C[kind]}{text}{C['reset']}" if USE_COLOR else text
+
+
+class Report:
+    def __init__(self, quiet: bool = False, as_json: bool = False):
+        self.results: list[dict] = []
+        self.quiet = quiet
+        self.as_json = as_json
+
+    def add(self, status: str, name: str, detail: str = "") -> None:
+        self.results.append({"status": status, "check": name, "detail": detail})
+        if self.as_json:
+            return
+        if self.quiet and status in ("PASS", "INFO", "SKIP"):
+            return
+        print(f"{col(status, f'{status:<4}')}  {name:<34} {detail}", flush=True)
+
+    def section(self, title: str) -> None:
+        if not self.as_json and not self.quiet:
+            print(f"\n{col('bold', '== ' + title)}", flush=True)
+
+    def counts(self) -> dict[str, int]:
+        out = {k: 0 for k in ("PASS", "WARN", "FAIL", "INFO", "SKIP")}
+        for r in self.results:
+            out[r["status"]] = out.get(r["status"], 0) + 1
+        return out
+
+
+def log_line(text: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STATE_DIR / "doctor.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{_dt.datetime.now().isoformat(timespec='seconds')} {text}\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- helpers
+
+def run(argv: list[str], timeout: float = 10.0, input_text: str | None = None) -> tuple[int, str, str]:
+    """Run a command; never raises. Returns (rc, stdout, stderr); rc 127 = missing, 124 = timeout."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                           input=input_text, errors="replace")
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+    except OSError as e:
+        return 126, "", str(e)
+
+
+def pgrep_exact(name: str) -> list[int]:
+    rc, out, _ = run(["/usr/bin/pgrep", "-x", name])
+    return [int(x) for x in out.split()] if rc == 0 else []
+
+
+def pgrep_full(pattern: str) -> list[int]:
+    rc, out, _ = run(["/usr/bin/pgrep", "-f", pattern])
+    return [int(x) for x in out.split()] if rc == 0 else []
+
+
+def proc_name(pid: int) -> str:
+    rc, out, _ = run(["/bin/ps", "-p", str(pid), "-o", "comm="])
+    return out.strip() if rc == 0 and out.strip() else f"pid {pid}"
+
+
+def omni_json(args: list[str], timeout: float = 5.0) -> dict | None:
+    rc, out, _ = run([OMNIWMCTL, *args, "--format", "json"], timeout=timeout)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not data.get("ok", False):
+        return None
+    return data.get("result", {}).get("payload")
+
+
+def omni_cmd(args: list[str]) -> int:
+    rc, _, _ = run([OMNIWMCTL, "command", *args], timeout=5.0)
+    return rc
+
+
+def active_workspace() -> dict | None:
+    p = omni_json(["query", "active-workspace"])
+    if not p:
+        return None
+    ws = p.get("workspace") or {}
+    disp = p.get("display") or {}
+    return {"number": ws.get("number"), "name": ws.get("rawName"), "id": ws.get("id"),
+            "display": disp.get("name"), "display_id": disp.get("id")}
+
+
+def list_workspaces() -> list[dict]:
+    p = omni_json(["query", "workspaces", "--fields",
+                   "id,raw-name,display-name,number,layout,display,is-focused,window-counts"])
+    return (p or {}).get("workspaces", []) if p else []
+
+
+def window_ids(bundle: str | None = None) -> list[dict]:
+    """Window ids + app only. NEVER request titles."""
+    args = ["query", "windows"]
+    if bundle:
+        args += ["--bundle-id", bundle]
+    args += ["--fields", "id,app,workspace"]
+    p = omni_json(args)
+    return (p or {}).get("windows", []) if p else []
+
+
+def focused_window_id() -> str | None:
+    p = omni_json(["query", "windows", "--focused", "--fields", "id,app"])
+    wins = (p or {}).get("windows", []) if p else []
+    return wins[0].get("id") if wins else None
+
+
+def hid_flags() -> int | None:
+    try:
+        cg = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        cg.CGEventSourceFlagsState.restype = ctypes.c_uint64
+        cg.CGEventSourceFlagsState.argtypes = [ctypes.c_int32]
+        return int(cg.CGEventSourceFlagsState(1))  # kCGEventSourceStateHIDSystemState
+    except (OSError, AttributeError):
+        return None
+
+
+def flags_str(flags: int) -> str:
+    names = [n for b, n in ((FLAG_CTRL, "ctrl"), (FLAG_ALT, "alt"), (FLAG_SHIFT, "shift"),
+                            (FLAG_CMD, "cmd")) if flags & b]
+    return "+".join(names) or "none"
+
+
+def secure_input_pids() -> list[int]:
+    rc, out, _ = run(["/usr/sbin/ioreg", "-a", "-d1", "-k", "IOConsoleUsers"], timeout=5)
+    pids: list[int] = []
+    if rc != 0:
+        return pids
+    try:
+        d = plistlib.loads(out.encode())
+    except Exception:
+        # fallback: text grep
+        m = re.findall(r'"kCGSSessionSecureInputPID"\s*=\s*(\d+)', out)
+        return sorted({int(x) for x in m})
+    for u in d.get("IOConsoleUsers", []) if isinstance(d, dict) else []:
+        pid = u.get("kCGSSessionSecureInputPID")
+        if isinstance(pid, int) and pid > 0:
+            pids.append(pid)
+    return sorted(set(pids))
+
+
+def read_tail(path: Path, max_bytes: int = 200_000) -> list[str]:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            return fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+LOG_TS = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.\d+)?\]")
+
+
+def parse_log_ts(line: str) -> float | None:
+    m = LOG_TS.match(line)
+    if not m:
+        return None
+    try:
+        return _dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+MOD_ALIASES = {
+    "control": "ctrl", "ctrl": "ctrl", "option": "alt", "opt": "alt", "alt": "alt",
+    "command": "cmd", "cmd": "cmd", "shift": "shift", "fn": "fn", "function": "fn",
+    "hyper": "hyper", "meh": "meh",
+}
+
+
+
+def expand_hyper(binding, hyper_mods="Control+Option+Command"):
+    """OmniWM writes chords matching general.hyperKeyModifiers back as 'Hyper+X'. Hyper is only a
+    display shorthand (still a Carbon hotkey; not paused unless systemHyperTrigger is set), so
+    expand it before comparing or classifying."""
+    if not isinstance(binding, str) or "Hyper" not in binding:
+        return binding
+    parts = [x.strip() for x in binding.split("+")]
+    out = []
+    for x in parts:
+        out.extend([m.strip() for m in hyper_mods.split("+")] if x == "Hyper" else [x])
+    key = out[-1]
+    order = ["Control", "Option", "Shift", "Command"]
+    mods = sorted(set(out[:-1]), key=lambda m: order.index(m) if m in order else 9)
+    return "+".join(mods + [key])
+
+def parse_omni_binding(binding: str) -> tuple[set[str], str, bool]:
+    """'Control+Option+Command+1' -> ({ctrl,alt,cmd}, '1', sided?)"""
+    parts = [p for p in binding.split("+")]
+    if binding.endswith("++"):
+        parts = parts[:-2] + ["+"]
+    mods: set[str] = set()
+    sided = False
+    key = parts[-1] if parts else ""
+    for p in parts[:-1]:
+        low = p.strip().lower()
+        for side in ("left", "right"):
+            if low.startswith(side):
+                sided = True
+                low = low[len(side):].strip()
+        mods.add(MOD_ALIASES.get(low, low))
+    return mods, key, sided
+
+
+# --------------------------------------------------------------------------- static checks
+
+class Static:
+    def __init__(self, rep: Report, args: argparse.Namespace):
+        self.r = rep
+        self.a = args
+        self.settings_path = Path(args.settings).expanduser() if args.settings else HOME / ".config/omniwm/settings.toml"
+        self.karabiner_path = Path(args.karabiner).expanduser() if args.karabiner else HOME / ".config/karabiner/karabiner.json"
+        self.bin_dir = Path(args.bin_dir).expanduser() if args.bin_dir else OM_DIR / "bin"
+        # omarchy-keys' own default is <its dir>/../bindings.toml; follow it so --bin-dir is consistent
+        self.bindings_path = self.bin_dir.parent / "bindings.toml"
+        self.hs_bindings_path = (Path(args.hs_bindings).expanduser() if args.hs_bindings
+                                 else HOME / ".hammerspoon/omarchy/generated/bindings.lua")
+        self.omni_up = False
+        self.hs_up = False
+        # 'sfltool dumpbtm' asks authd for system.privilege.admin, which can put a SecurityAgent
+        # PASSWORD DIALOG on screen (verified 2026-11-23 on 27.0) and then block for minutes.
+        # It is therefore opt-in (--login-sfltool); start it early so it overlaps the other checks.
+        self._btm = None
+        self._btm_t0 = time.time()
+        if args.login_sfltool and not args.no_login_items:
+            try:
+                self._btm = subprocess.Popen(["/usr/bin/sfltool", "dumpbtm"], stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                             text=True, errors="replace")
+            except OSError:
+                self._btm = None
+
+    def all(self) -> None:
+        steps = [
+            ("Processes", self.processes),
+            ("OmniWM", self.omniwm),
+            ("Karabiner", self.karabiner),
+            ("Key remapping & input state", self.input_state),
+            ("OmniWM settings.toml", self.settings),
+            ("Bindings generator", self.keys_check),
+            ("Dispatch scripts", self.dispatch),
+            ("Hammerspoon", self.hammerspoon),
+            ("Theme", self.theme),
+            ("Ghostty", self.ghostty),
+            ("Login items", self.login_items),
+        ]
+        try:
+            for title, fn in steps:
+                self.r.section(title)
+                try:
+                    fn()
+                except Exception as e:  # the doctor itself must never crash
+                    self.r.add("FAIL", f"{title.lower()}.internal", f"doctor error: {type(e).__name__}: {e}")
+        finally:
+            # Ctrl+C (or any early exit) must not leave 'sfltool dumpbtm' running: it is the
+            # process that holds the admin password dialog open and blocks for minutes.
+            if self._btm is not None and self._btm.poll() is None:
+                try:
+                    self._btm.kill()
+                    self._btm.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+    # ---- processes
+    def processes(self) -> None:
+        r = self.r
+        pids = pgrep_exact("OmniWM")
+        self.omni_up = bool(pids)
+        r.add("PASS" if pids else "FAIL", "process.omniwm", f"pid {pids[0]}" if pids else "OmniWM is not running")
+        pids = pgrep_exact("Hammerspoon")
+        self.hs_up = bool(pids)
+        r.add("PASS" if pids else "FAIL", "process.hammerspoon", f"pid {pids[0]}" if pids else "Hammerspoon is not running")
+        # process names > 16 chars are truncated in p_comm, so match the full path
+        pids = pgrep_full("Karabiner-Core-Service.app/Contents/MacOS/Karabiner-Core-Service")
+        r.add("PASS" if pids else "FAIL", "process.karabiner-core-service",
+              f"pids {' '.join(map(str, pids))}" if pids else "Karabiner-Core-Service not running (Karabiner Settings > Setup)")
+        pids = pgrep_full("Karabiner-Console-User-Server")
+        r.add("PASS" if pids else "FAIL", "process.karabiner-console-user",
+              f"pid {pids[0]}" if pids else "Console-User-Server not running: shell_command rules cannot run")
+        pids = pgrep_full("org.pqrs.Karabiner-DriverKit-VirtualHIDDevice")
+        r.add("PASS" if pids else "WARN", "process.karabiner-virtualhid",
+              "running" if pids else "DriverKit virtual keyboard not found (approve the driver extension)")
+        pids = pgrep_exact("Moom")
+        if pids:
+            r.add("FAIL", "process.moom", f"Moom is running (pid {pids[0]}); its Ctrl+Opt+Cmd hotkeys collide with Super")
+        elif Path("/Applications/Moom.app").exists():
+            r.add("WARN", "process.moom", "not running, but /Applications/Moom.app is still installed")
+        else:
+            r.add("PASS", "process.moom", "not running, not installed")
+        pids = pgrep_exact("Maccy")
+        r.add("PASS" if pids else "WARN", "process.maccy",
+              "running" if pids else "Maccy not running: Super+Ctrl+V (clipboard history) does nothing")
+
+    # ---- omniwm
+    def omniwm(self) -> None:
+        r = self.r
+        if not Path(OMNIWMCTL).exists():
+            r.add("FAIL", "omniwm.cli", f"{OMNIWMCTL} missing")
+            return
+        rc, out, err = run([OMNIWMCTL, "ping"], timeout=5)
+        ok = rc == 0 and "pong" in out
+        r.add("PASS" if ok else "FAIL", "omniwm.ping", "pong" if ok else f"rc={rc} {(out + err).strip()[:120]}")
+        rc, out, _ = run([OMNIWMCTL, "version"], timeout=5)
+        if rc == 0:
+            r.add("INFO", "omniwm.version", out.strip().splitlines()[0] if out.strip() else "?")
+        if not ok:
+            return
+        wss = list_workspaces()
+        if not wss:
+            r.add("FAIL", "omniwm.workspaces", "query workspaces returned nothing")
+        else:
+            summary = []
+            niri = []
+            for w in wss:
+                n = w.get("number") or w.get("rawName")
+                disp = (w.get("display") or {}).get("name", "?")
+                lay = w.get("layout", "?")
+                tot = (w.get("counts") or {}).get("total", 0)
+                summary.append(f"{w.get('displayName') or n}:{lay}{'*' if w.get('isFocused') else ''}({tot})@{disp[:10]}")
+                if lay == "niri" and str(n) not in self.allowed_niri():
+                    niri.append(str(n))
+            r.add("INFO", "omniwm.workspaces", " ".join(summary))
+            if niri:
+                r.add("WARN", "omniwm.workspaces.layout",
+                      f"runtime niri on workspace(s) {', '.join(niri)} (OK if toggled on purpose with Super+L)")
+            else:
+                r.add("PASS", "omniwm.workspaces.layout", "all workspaces dwindle (or allowed niri)")
+        p = omni_json(["query", "shell-widgets"])
+        if p is None:
+            r.add("WARN", "omniwm.shell-widgets", "query failed")
+        else:
+            probs = p.get("problems") or []
+            bad = [w.get("name", "?") + "=" + str(w.get("state")) for w in p.get("widgets", [])
+                   if w.get("state") not in ("loaded", None)]
+            if probs:
+                r.add("FAIL", "omniwm.shell-widgets", f"{len(probs)} problem(s): " + "; ".join(
+                    (json.dumps(x) if not isinstance(x, str) else x)[:160] for x in probs[:5]))
+            elif bad:
+                r.add("WARN", "omniwm.shell-widgets", "not loaded: " + ", ".join(bad))
+            else:
+                names = ",".join(w.get("name", "?") for w in p.get("widgets", []))
+                r.add("PASS", "omniwm.shell-widgets", f"profile {p.get('profile')}; no problems [{names}]")
+
+        if not self.a.settings:
+            p = omni_json(["query", "rules"])
+            if p is None:
+                r.add("WARN", "omniwm.rules.citrix", "query rules failed")
+            else:
+                self._citrix_rule(p.get("rules") or [], "omniwmctl query rules")
+
+    def _citrix_rule(self, rules: list[dict], source: str) -> None:
+        """Safety rule: Citrix Viewer (the EMR session) must float, so tiling never resizes it."""
+        hits = [x for x in rules if str(x.get("bundleId", "")) == CITRIX_BUNDLE]
+        # User choice (2026-11-23): Citrix Viewer tiles like any other window.
+        if not any(x.get("layout") == "float" for x in hits):
+            self.r.add("PASS", "omniwm.rules.citrix", f"{CITRIX_BUNDLE} tiles (no float rule) ({source})")
+            return
+        self.r.add("WARN", "omniwm.rules.citrix", f"{CITRIX_BUNDLE} has a float rule; user chose tiling")
+        return
+        if not hits:
+            self.r.add("FAIL", "omniwm.rules.citrix",
+                       f"no app rule for {CITRIX_BUNDLE} ({source}); add one: omniwmctl rule add "
+                       f"--bundle-id {CITRIX_BUNDLE} --layout float")
+            return
+        first = hits[0]  # rules are evaluated in order; the first one for the bundle decides
+        valid = first.get("isValid", True)
+        if first.get("layout") == "float" and valid:
+            self.r.add("PASS", "omniwm.rules.citrix", f"{CITRIX_BUNDLE} floats ({source})")
+        else:
+            self.r.add("FAIL", "omniwm.rules.citrix",
+                       f"{CITRIX_BUNDLE} rule layout={first.get('layout')!r} valid={valid} (must be a valid float rule)")
+
+    def allowed_niri(self) -> set[str]:
+        raw = self.a.allow_niri or os.environ.get("OMARCHY_DOCTOR_ALLOW_NIRI", "")
+        return {x.strip() for x in raw.split(",") if x.strip()}
+
+    # ---- karabiner
+    def karabiner(self) -> None:
+        r = self.r
+        path = self.karabiner_path
+        try:
+            cfg = json.loads(path.read_text())
+        except FileNotFoundError:
+            r.add("FAIL", "karabiner.json", f"{path} missing")
+            return
+        except (OSError, json.JSONDecodeError) as e:
+            r.add("FAIL", "karabiner.json", f"does not parse: {e}")
+            return
+        r.add("PASS", "karabiner.json.parse", str(path))
+        profiles = cfg.get("profiles") or []
+        sel = [p for p in profiles if p.get("selected")]
+        prof = sel[0] if sel else None
+        if not prof:
+            r.add("FAIL", "karabiner.profile", "no selected profile")
+            return
+        name = prof.get("name")
+        r.add("PASS" if name == "Omarchy" else "FAIL", "karabiner.profile.selected",
+              f"selected profile is {name!r}" + ("" if name == "Omarchy" else " (expected 'Omarchy')"))
+        cli = KARABINER_CLI if Path(KARABINER_CLI).exists() else KARABINER_CLI_BETA
+        if not self.a.karabiner and Path(cli).exists():
+            rc, out, _ = run([cli, "--show-current-profile-name"], timeout=5)
+            if rc == 0:
+                cur = out.strip()
+                r.add("PASS" if cur == "Omarchy" else "FAIL", "karabiner.profile.active",
+                      f"karabiner_cli reports {cur!r}")
+        sm = prof.get("simple_modifications") or []
+        if sm:
+            desc = "; ".join(json.dumps(x.get("from")) + "->" + json.dumps(x.get("to")) for x in sm[:3])
+            r.add("FAIL", "karabiner.simple_modifications", f"{len(sm)} present (must be none): {desc}")
+        else:
+            r.add("PASS", "karabiner.simple_modifications", "none")
+        for dev in prof.get("devices") or []:
+            if dev.get("simple_modifications"):
+                ident = dev.get("identifiers", {})
+                r.add("FAIL", "karabiner.device.simple_mods",
+                      f"device {ident.get('vendor_id')}:{ident.get('product_id')} has simple_modifications")
+        rules = (prof.get("complex_modifications") or {}).get("rules") or []
+        params = (prof.get("complex_modifications") or {}).get("parameters") or {}
+        manips = [m for rule in rules for m in rule.get("manipulators", [])]
+        if not manips:
+            r.add("FAIL", "karabiner.rules", "no complex_modifications rules")
+            return
+        r.add("PASS", "karabiner.rules", f"{len(rules)} rules, {len(manips)} manipulators")
+        self._karabiner_caps(manips, params)
+        self._karabiner_swallow(manips)
+        self._karabiner_shell(manips)
+        if not self.a.karabiner:
+            self._karabiner_log(path)
+
+    def _karabiner_caps(self, manips: list[dict], params: dict) -> None:
+        r = self.r
+        caps = [m for m in manips if (m.get("from") or {}).get("key_code") == "caps_lock"]
+        normal = None
+        citrix = None
+        def names_citrix(c: dict) -> bool:
+            ids = [re.sub(r"[\\^$]", "", str(x)) for x in c.get("bundle_identifiers") or []]
+            return CITRIX_BUNDLE in ids
+        for m in caps:
+            conds = m.get("conditions") or []
+            if any(c.get("type") == "frontmost_application_if" and names_citrix(c) for c in conds):
+                citrix = citrix or m
+            elif not any(c.get("type") == "frontmost_application_if" for c in conds):
+                normal = normal or m
+        if not normal:
+            r.add("FAIL", "karabiner.caps.super", "no Caps Lock -> Super manipulator found")
+        else:
+            to = normal.get("to") or []
+            keyed = [t for t in to if t.get("key_code")]
+            held = keyed[0] if keyed else {}
+            mods = {x for t in keyed for x in (t.get("key_code"), *(t.get("modifiers") or []))}
+            want = {"right_command", "right_option", "right_control"}
+            setvar = any((t.get("set_variable") or {}).get("name") == "omarchy_super" for t in to)
+            reset = any((t.get("set_variable") or {}).get("name") == "omarchy_super"
+                        for t in normal.get("to_after_key_up") or [])
+            alone = [t.get("key_code") for t in normal.get("to_if_alone") or []]
+            lazy = any(t.get("lazy") for t in keyed)
+            problems = []
+            if not want.issubset(mods):
+                problems.append(f"emits {sorted(x for x in mods if x)} (want {sorted(want)})")
+            if not setvar:
+                problems.append("does not set omarchy_super")
+            if not reset:
+                problems.append("omarchy_super not reset in to_after_key_up")
+            if lazy:
+                problems.append("lazy=true (mouse clicks would not carry the flags)")
+            r.add("FAIL" if problems else "PASS", "karabiner.caps.super",
+                  "; ".join(problems) if problems else "Caps -> held rcmd+ropt+rctrl, sets/resets omarchy_super")
+            timeout = (normal.get("parameters") or {}).get("basic.to_if_alone_timeout_milliseconds",
+                                                           params.get("basic.to_if_alone_timeout_milliseconds", 1000))
+            if alone != ["escape"]:
+                r.add("WARN", "karabiner.caps.tap", f"to_if_alone={alone} (expected escape)")
+            elif timeout != 500:
+                r.add("WARN", "karabiner.caps.tap", f"tap=escape but to_if_alone timeout {timeout} ms (contract: 500)")
+            else:
+                r.add("PASS", "karabiner.caps.tap", "tap alone = escape (500 ms)")
+        if not citrix:
+            r.add("FAIL", "karabiner.caps.citrix", f"no Citrix-specific Caps rule ({CITRIX_BUNDLE})")
+        else:
+            to = citrix.get("to") or []
+            emits = [t for t in to if t.get("key_code") and t.get("key_code") != "vk_none"]
+            alone = [t.get("key_code") for t in citrix.get("to_if_alone") or [] if t.get("key_code") not in (None, "vk_none")]
+            if emits or alone:
+                r.add("FAIL", "karabiner.caps.citrix", f"Citrix Caps rule emits keys {emits or alone} (must only set the variable)")
+            elif caps.index(citrix) > caps.index(normal) if normal in caps else False:
+                r.add("FAIL", "karabiner.caps.citrix", "Citrix Caps rule comes AFTER the normal Caps rule (first match wins)")
+            else:
+                r.add("PASS", "karabiner.caps.citrix", "Citrix: Caps only sets omarchy_super")
+        # Super-layer guards / KB rules sanity: mandatory modifiers on omarchy_super rules
+        sloppy = 0
+        for m in manips:
+            conds = m.get("conditions") or []
+            if not any(c.get("type") == "variable_if" and c.get("name") == "omarchy_super" for c in conds):
+                continue
+            fm = (m.get("from") or {}).get("modifiers") or {}
+            to = m.get("to") or []
+            if to and all(t.get("key_code") == "vk_none" for t in to):
+                continue  # swallow guards may legitimately match any modifiers
+            if fm.get("optional"):
+                sloppy += 1
+        if sloppy:
+            r.add("WARN", "karabiner.super.optional-mods", f"{sloppy} Super-layer manipulator(s) use optional modifiers")
+
+    @staticmethod
+    def _kb_mods_match(fm: dict, held: set[str]) -> bool:
+        """Karabiner from.modifiers semantics: every mandatory held, every other held one optional."""
+        def sat(want: str, have: str) -> bool:
+            return want == have or (want in ("command", "option", "control", "shift") and have.endswith("_" + want))
+        left = set(held)
+        for want in fm.get("mandatory") or []:
+            hit = next((h for h in left if sat(want, h)), None)
+            if hit is None:
+                return False
+            left.discard(hit)
+        opt = fm.get("optional") or []
+        return all("any" in opt or any(sat(o, h) for o in opt) for h in left)
+
+    def _karabiner_swallow(self, manips: list[dict]) -> None:
+        """Contract: bound OW/HS chords must NOT be swallowed (or remapped) by Karabiner outside Citrix."""
+        r = self.r
+        chords: list[tuple[str, str, bool, str]] = []  # (owner:label, kb key_code, shift?, chord text)
+        unknown: list[str] = []
+        try:
+            data = tomllib.loads(self.settings_path.read_text())
+            for h in data.get("hotkeys") or []:
+                b = h.get("binding")
+                if not b or b == "Unassigned":
+                    continue
+                mods, key, _ = parse_omni_binding(b)
+                if not ({"ctrl", "alt", "cmd"} <= mods <= {"ctrl", "alt", "cmd", "shift"}):
+                    continue
+                kc = OMNI_KEY_TO_KB.get(key.strip().lower())
+                if kc is None:
+                    unknown.append(f"OW {b}")
+                    continue
+                chords.append((f"OW {h.get('id')}", kc, "shift" in mods, b))
+        except (OSError, tomllib.TOMLDecodeError):
+            pass  # reported by the settings section
+        try:
+            text = self.hs_bindings_path.read_text(errors="replace")
+            block = text.split("hotkeys = {", 1)[1].split("\n  all = {", 1)[0] if "hotkeys = {" in text else ""
+            for ln in block.splitlines():
+                m = re.search(r'mods = \{([^}]*)\}, key = "((?:[^"\\]|\\.)*)"', ln)
+                if not m or "bridge = true" in ln:  # bridge keys are emitted BY Karabiner, never matched by it
+                    continue
+                mods = set(re.findall(r'"(\w+)"', m.group(1)))
+                key = m.group(2).replace('\\"', '"').replace("\\\\", "\\")  # Lua string escapes
+                if not ({"ctrl", "alt", "cmd"} <= mods <= {"ctrl", "alt", "cmd", "shift"}):
+                    continue
+                kc = HS_KEY_TO_KB.get(key.lower())
+                cm = re.search(r'chord = "([^"]*)"', ln)
+                label = cm.group(1) if cm else f"{'+'.join(sorted(mods))}+{key}"
+                if kc is None:
+                    unknown.append(f"HS {label}")
+                    continue
+                chords.append((f"HS {label}", kc, "shift" in mods, label))
+        except OSError:
+            pass  # reported by the Hammerspoon section
+        if not chords:
+            r.add("SKIP", "karabiner.super.not-swallowed", "no OW/HS Super chords found to check")
+            return
+
+        def applies(m: dict) -> bool:
+            for c in m.get("conditions") or []:
+                t = c.get("type")
+                if t == "frontmost_application_if":
+                    return False  # app-specific (Citrix): handled on purpose
+                if t == "variable_if" and (c.get("name") != "omarchy_super" or c.get("value") != 1):
+                    return False
+                if t == "variable_unless" and c.get("name") == "omarchy_super":
+                    return False
+            return True
+        live = [m for m in manips if applies(m) and (m.get("from") or {}).get("key_code")]
+        swallowed, remapped = [], []
+        for owner, kc, shift, label in chords:
+            held = set(SUPER_HELD) | ({"left_shift"} if shift else set())
+            first = next((m for m in live if m["from"]["key_code"] == kc
+                          and self._kb_mods_match(m["from"].get("modifiers") or {}, held)), None)
+            if first is None:
+                continue
+            to = first.get("to") or []
+            if to and all(t.get("key_code") == "vk_none" for t in to):
+                swallowed.append(owner)
+            else:
+                remapped.append(owner)
+        if swallowed:
+            r.add("FAIL", "karabiner.super.not-swallowed",
+                  f"{len(swallowed)} bound chord(s) swallowed by a vk_none guard: " + ", ".join(swallowed[:8]))
+        else:
+            r.add("PASS", "karabiner.super.not-swallowed", f"none of {len(chords)} bound OW/HS Super chords is swallowed")
+        if remapped:
+            r.add("WARN", "karabiner.super.remapped",
+                  f"{len(remapped)} OW/HS chord(s) are rewritten by Karabiner first: " + ", ".join(remapped[:8]))
+        if unknown:
+            r.add("WARN", "karabiner.super.unknown-keys", "cannot map to a key_code: " + ", ".join(unknown[:8]))
+
+    def _karabiner_shell(self, manips: list[dict]) -> None:
+        r = self.r
+        missing: dict[str, int] = {}
+        nonabs: set[str] = set()
+        count = 0
+        for m in manips:
+            for key in ("to", "to_if_alone", "to_after_key_up", "to_if_held_down"):
+                for t in m.get(key) or []:
+                    sc = t.get("shell_command")
+                    if not sc:
+                        continue
+                    count += 1
+                    first = sc.strip().split()[0].strip("'\"") if sc.strip() else ""
+                    if first in ("export", "env") or "=" in first:
+                        continue
+                    if not first.startswith("/"):
+                        nonabs.add(first)
+                    elif not os.access(first, os.X_OK):
+                        missing[first] = missing.get(first, 0) + 1
+        if count == 0:
+            r.add("WARN", "karabiner.shell_command", "no shell_command rules (KB layers missing?)")
+            return
+        if missing:
+            r.add("FAIL", "karabiner.shell_command.targets",
+                  "not executable: " + ", ".join(f"{k} (x{v})" for k, v in missing.items()))
+        else:
+            r.add("PASS", "karabiner.shell_command.targets", f"{count} shell_commands, all targets executable")
+        if nonabs:
+            r.add("WARN", "karabiner.shell_command.paths", "relative commands (minimal PATH!): " + ", ".join(sorted(nonabs)))
+
+    def _karabiner_log(self, path: Path) -> None:
+        r = self.r
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        logs = [HOME / ".local/share/karabiner/log/console_user_server.log", Path("/var/log/karabiner/core_service.log")]
+        for lp in logs:
+            lines = read_tail(lp)
+            label = "karabiner.log." + ("console_user" if "console" in lp.name else "core_service")
+            if not lines:
+                r.add("WARN", label, f"cannot read {lp}")
+                continue
+            idx = max((i for i, ln in enumerate(lines) if "Load " in ln and "karabiner.json" in ln), default=None)
+            if idx is None:
+                r.add("WARN", label, "no 'Load …karabiner.json' line in log tail")
+                continue
+            after = lines[idx + 1: idx + 40]
+            nxt = next((j for j, ln in enumerate(after) if "Load " in ln and "karabiner.json" in ln), len(after))
+            after = after[:nxt]
+            errs = [ln for ln in after if "[error]" in ln or ("[warn" in ln and re.search(r"json|parse|config", ln, re.I))]
+            updated = any("core_configuration is updated" in ln for ln in after)
+            ts = parse_log_ts(lines[idx])
+            when = lines[idx][1:20]
+            if errs:
+                r.add("FAIL", label, f"last load {when}: {errs[0][:160]}")
+            elif not updated:
+                r.add("WARN", label, f"last load {when}: no 'core_configuration is updated' after it")
+            elif ts is not None and mtime and ts + 2 < mtime:
+                r.add("WARN", label, f"last load {when} is older than karabiner.json mtime (not reloaded yet?)")
+            else:
+                r.add("PASS", label, f"last load {when}: core_configuration is updated, no errors")
+
+    # ---- input state
+    def input_state(self) -> None:
+        r = self.r
+        rc, out, err = run(["/usr/bin/hidutil", "property", "--get", "UserKeyMapping"], timeout=10)
+        if rc != 0:
+            r.add("WARN", "hidutil.mapping", f"hidutil failed: {err.strip()[:100]}")
+        else:
+            pairs = re.findall(r"HIDKeyboardModifierMappingDst\s*=\s*(\d+);\s*HIDKeyboardModifierMappingSrc\s*=\s*(\d+);", out)
+            pairs += [(d, s) for s, d in re.findall(
+                r"HIDKeyboardModifierMappingSrc\s*=\s*(\d+);\s*HIDKeyboardModifierMappingDst\s*=\s*(\d+);", out)]
+            caps_f18 = sum(1 for d, s in pairs if int(s) == HID_CAPS and int(d) == HID_F18)
+            caps_other = sum(1 for d, s in pairs if int(s) == HID_CAPS and int(d) != HID_F18)
+            other = len(pairs) - caps_f18 - caps_other
+            if caps_f18:
+                r.add("FAIL", "hidutil.caps-f18", f"Caps->F18 mapping present on {caps_f18} HID service(s); "
+                      "clear: hidutil property --set '{\"UserKeyMapping\":[]}'")
+            elif caps_other:
+                r.add("FAIL", "hidutil.caps", f"Caps remapped by hidutil on {caps_other} service(s) (Karabiner must own Caps)")
+            else:
+                r.add("PASS", "hidutil.caps-f18", "no Caps Lock hidutil mapping")
+            if other:
+                r.add("WARN", "hidutil.other", f"{other} other UserKeyMapping entries present")
+        pids = secure_input_pids()
+        if pids:
+            owners = ", ".join(f"{proc_name(p)} ({p})" for p in pids)
+            r.add("WARN", "secure-input", f"ON, held by {owners}: tap-based features (Super+scroll) paused")
+        else:
+            r.add("PASS", "secure-input", "off")
+        fl = hid_flags()
+        if fl is None:
+            r.add("WARN", "modifiers.hid", "cannot read CGEventSourceFlagsState")
+        else:
+            held = fl & (SUPER_FLAGS | FLAG_SHIFT)
+            if held:
+                r.add("WARN", "modifiers.hid", f"modifiers held right now: {flags_str(held)} "
+                      "(stuck? re-run without touching the keyboard)")
+            else:
+                r.add("PASS", "modifiers.hid", "no modifiers held")
+
+    # ---- settings.toml
+    def settings(self) -> None:
+        r = self.r
+        p = self.settings_path
+        try:
+            data = tomllib.loads(p.read_text())
+        except FileNotFoundError:
+            r.add("FAIL", "settings.parse", f"{p} missing")
+            return
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            r.add("FAIL", "settings.parse", f"{p}: {e}")
+            return
+        r.add("PASS", "settings.parse", f"{p} (schemaVersion {data.get('schemaVersion')})")
+        try:
+            smt = p.stat().st_mtime
+            corrupt = [c for c in p.parent.glob(p.name + ".corrupt*") if c.stat().st_mtime >= smt - 3600]
+            if corrupt:
+                r.add("WARN", "settings.corrupt-files", "recent: " + ", ".join(c.name for c in corrupt))
+        except OSError:
+            pass
+
+        hk = data.get("hotkeys") or []
+        bound = [h for h in hk if h.get("binding") and h.get("binding") != "Unassigned"]
+        r.add("INFO", "settings.hotkeys", f"{len(hk)} ids, {len(bound)} bound")
+        if not bound:
+            r.add("FAIL", "settings.hotkeys.bound", "no OmniWM hotkeys bound (generator output not installed)")
+        option_defaults, sided, nosecure, seen, dups = [], [], [], {}, []
+        hyper_mods = (data.get("general") or {}).get("hyperKeyModifiers") or "Control+Option+Command"
+        for h in bound:
+            mods, key, is_sided = parse_omni_binding(expand_hyper(h["binding"], hyper_mods))
+            hid = h.get("id", "?")
+            if mods and mods <= {"alt", "shift"}:
+                option_defaults.append(f"{hid}={h['binding']}")
+            if is_sided:
+                sided.append(f"{hid}={h['binding']}")
+            if not ({"ctrl", "cmd"} & mods):
+                nosecure.append(f"{hid}={h['binding']}")
+            norm = (frozenset(mods), key.lower())
+            if norm in seen:
+                dups.append(f"{h['binding']} ({seen[norm]} & {hid})")
+            else:
+                seen[norm] = hid
+        if option_defaults:
+            r.add("FAIL", "settings.hotkeys.option-defaults",
+                  f"{len(option_defaults)} Option/Option+Shift bindings (OmniWM defaults leaking): " + ", ".join(option_defaults[:6]))
+        elif bound:
+            r.add("PASS", "settings.hotkeys.option-defaults", "no Option+N style default bindings")
+        if dups:
+            r.add("FAIL", "settings.hotkeys.duplicates", "; ".join(dups[:6]))
+        if sided:
+            r.add("WARN", "settings.hotkeys.sided", "Left/Right-specific bindings pause under Secure Input: " + ", ".join(sided[:6]))
+        if nosecure:
+            r.add("WARN", "settings.hotkeys.no-ctrl-cmd", "bindings without Control/Command pause under Secure Input: "
+                  + ", ".join(nosecure[:6]))
+
+        g = data.get("general") or {}
+        ge = data.get("gestures") or {}
+        fo = data.get("focus") or {}
+        mw = data.get("mouseWarp") or {}
+        sw = data.get("windowSwitcher") or {}
+        self._expect("settings.general.defaultLayoutType", g.get("defaultLayoutType"), "dwindle", "WARN")
+        self._expect("settings.general.systemHyperTrigger", g.get("systemHyperTrigger"), "None", "WARN")
+        self._expect("settings.gestures.mouseMoveModifierKey", ge.get("mouseMoveModifierKey"), "controlOptionCommand", "FAIL")
+        self._expect("settings.gestures.mouseResizeModifierKey", ge.get("mouseResizeModifierKey"), "controlOptionCommand", "FAIL")
+        smk = ge.get("scrollModifierKey")
+        if smk == "controlOptionCommand":
+            r.add("FAIL", "settings.gestures.scrollModifierKey", "controlOptionCommand collides with Hammerspoon Super+scroll")
+        else:
+            r.add("PASS", "settings.gestures.scrollModifierKey", f"{smk!r} (does not collide with Super+scroll)")
+        # User choice (2026-11-23): Omarchy-style focus follows mouse + pointer warps to keyboard focus.
+        self._expect("settings.focus.followsMouse", fo.get("followsMouse"), True, "WARN")
+        self._expect("settings.focus.moveMouseToFocusedWindow", fo.get("moveMouseToFocusedWindow"), True, "WARN")
+        self._expect("settings.windowSwitcher.optionTab", sw.get("optionTab"), "disabled", "WARN",
+                     "Option+Tab is captured; Alt+Tab will not reach the Citrix Windows session")
+        for e in (data.get("launcher") or {}).get("entries") or []:
+            if re.search(r"(^|/)hs\s+-c", str(e.get("command", ""))):
+                r.add("WARN", "settings.launcher.hs-c", f"launcher entry {e.get('name')!r} calls 'hs -c' (ipc flood risk)")
+
+        wss = data.get("workspaces") or []
+        allowed = self.allowed_niri()
+        bad_niri, info = [], []
+        names = {}
+        for w in wss:
+            name = str(w.get("name"))
+            lay = w.get("layoutType", "default")
+            asg = (w.get("monitorAssignment") or {}).get("type", "?")
+            names[name] = w
+            info.append(f"{name}{'(' + w['displayName'] + ')' if w.get('displayName') else ''}:{lay}@{asg}")
+            if lay == "niri" and name not in allowed:
+                bad_niri.append(name)
+        r.add("INFO", "settings.workspaces", " ".join(info))
+        if "1" in bad_niri:
+            r.add("WARN", "settings.workspaces.layout", "workspace 1 is niri (saved by a Super+L toggle; Super+L again for dwindle)")
+        elif bad_niri:
+            r.add("WARN", "settings.workspaces.layout", f"niri in settings for {', '.join(bad_niri)} "
+                  "(pass --allow-niri if intentional)")
+        else:
+            r.add("PASS", "settings.workspaces.layout", "all workspaces dwindle/default (or allowed niri)")
+        for n, emoji in (("6", "❤️"), ("7", "🚀")):
+            w = names.get(n)
+            if not w:
+                r.add("WARN", f"settings.workspaces.{n}", "missing (user customization lost?)")
+            elif w.get("displayName") != emoji or (w.get("monitorAssignment") or {}).get("type") != "secondary":
+                r.add("WARN", f"settings.workspaces.{n}",
+                      f"displayName={w.get('displayName')!r} assignment={(w.get('monitorAssignment') or {}).get('type')!r} "
+                      f"(expected {emoji} on secondary)")
+            else:
+                r.add("PASS", f"settings.workspaces.{n}", f"{emoji} on secondary preserved")
+        if any(str(w.get("name")) == "10" for w in wss):
+            r.add("WARN", "settings.workspaces.10", "workspace 10 exists (contract: no workspace 10)")
+        if self.a.settings:  # checking a file, not the running OmniWM: read its [[appRules]]
+            self._citrix_rule(data.get("appRules") or [], str(p))
+
+    def _expect(self, name: str, got, want, level: str, why: str = "") -> None:
+        if got == want:
+            self.r.add("PASS", name, repr(got))
+        else:
+            self.r.add(level, name, f"{got!r} (expected {want!r}){' - ' + why if why else ''}")
+
+    # ---- generator
+    def keys_check(self) -> None:
+        r = self.r
+        tool = self.bin_dir / "omarchy-keys"
+        bindings = self.bindings_path
+        if bindings.exists():
+            r.add("PASS", "bindings.toml", str(bindings))
+        else:
+            r.add("FAIL", "bindings.toml", f"{bindings} missing")
+        if not os.access(tool, os.X_OK):
+            r.add("WARN", "omarchy-keys.check", f"{tool} not installed; skipped")
+            return
+        rc, out, err = run([str(tool), "check", "--bindings", str(bindings), "--settings", str(self.settings_path),
+                            "--karabiner", str(self.karabiner_path)], timeout=60)
+        tail = " | ".join((out + err).strip().splitlines()[-4:])[:300]
+        r.add("PASS" if rc == 0 else "FAIL", "omarchy-keys.check", f"rc={rc} {tail}")
+        self._drift(tool)
+
+    def _drift(self, tool: Path) -> None:
+        """Regenerate into a private temp dir and compare with what is installed (read-only on live files)."""
+        import tempfile
+        r = self.r
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix="doctor-gen-", dir=STATE_DIR))
+        try:
+            argv = [str(tool), "generate", "--out", str(tmp), "--bindings", str(self.bindings_path),
+                    "--settings", str(self.settings_path), "--karabiner", str(self.karabiner_path)]
+            rc, out, err = run(argv, timeout=90)
+            if rc != 0:
+                r.add("FAIL", "omarchy-keys.generate", f"rc={rc} " + " | ".join((out + err).strip().splitlines()[-3:])[:250])
+                return
+            # OmniWM hotkeys
+            try:
+                live = tomllib.loads(self.settings_path.read_text()).get("hotkeys") or []
+                gen = tomllib.loads((tmp / "settings.toml").read_text()).get("hotkeys") or []
+                hyper_mods = (tomllib.loads(self.settings_path.read_text()).get("general") or {}).get(
+                    "hyperKeyModifiers") or "Control+Option+Command"
+                lm = {h.get("id"): expand_hyper(h.get("binding"), hyper_mods) for h in live}
+                gm = {h.get("id"): expand_hyper(h.get("binding"), hyper_mods) for h in gen}
+                diff = [f"{k}: {lm.get(k)!r}->{gm.get(k)!r}" for k in sorted(set(lm) | set(gm), key=str)
+                        if lm.get(k) != gm.get(k)]
+                if diff:
+                    r.add("FAIL", "drift.omniwm-hotkeys", f"{len(diff)} hotkey(s) differ from bindings.toml "
+                          f"(run deploy / omarchy-keys generate): " + "; ".join(diff[:4]))
+                else:
+                    r.add("PASS", "drift.omniwm-hotkeys", f"all {len(gm)} [[hotkeys]] match bindings.toml")
+            except (OSError, tomllib.TOMLDecodeError) as e:
+                r.add("WARN", "drift.omniwm-hotkeys", f"cannot compare: {e}")
+            # Karabiner rules
+            try:
+                def rules(path: Path):
+                    cfg = json.loads(path.read_text())
+                    prof = next((p for p in cfg.get("profiles", []) if p.get("selected")), {})
+                    return (prof.get("complex_modifications") or {}).get("rules") or []
+                lr, gr = rules(self.karabiner_path), rules(tmp / "karabiner.json")
+                if lr == gr:
+                    r.add("PASS", "drift.karabiner", f"{len(gr)} rules match bindings.toml")
+                else:
+                    r.add("FAIL", "drift.karabiner", f"installed rules ({len(lr)}) differ from generated ({len(gr)})")
+            except (OSError, json.JSONDecodeError) as e:
+                r.add("WARN", "drift.karabiner", f"cannot compare: {e}")
+            # Hammerspoon generated bindings
+            hl = self.hs_bindings_path
+            gl = tmp / "hammerspoon/omarchy/generated/bindings.lua"
+            try:
+                def body(path: Path) -> list[str]:  # ignore the embedded generation timestamp
+                    return [ln for ln in path.read_text(errors="replace").splitlines()
+                            if not re.match(r"\s*generated(_at)?\s*=\s*\"\d{4}-", ln)]
+                same = body(hl) == body(gl)
+                r.add("PASS" if same else "FAIL", "drift.hs-bindings",
+                      "generated/bindings.lua matches" if same else "installed bindings.lua differs from bindings.toml")
+            except OSError as e:
+                r.add("WARN" if not hl.exists() else "FAIL", "drift.hs-bindings", f"cannot compare: {e.strerror}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- dispatch scripts
+    def dispatch(self) -> None:
+        r = self.r
+        for name in ("omarchy-wm", "omarchy-omniwm-set", "omarchy-theme", "omarchy-keys", "omarchy-doctor"):
+            f = self.bin_dir / name
+            if os.access(f, os.X_OK):
+                link = HOME / ".local/bin" / name
+                if link.is_symlink() and link.resolve() == f.resolve():
+                    r.add("PASS", f"bin.{name}", f"{f} (linked in ~/.local/bin)")
+                else:
+                    r.add("WARN", f"bin.{name}", f"{f} present, but ~/.local/bin/{name} does not link to it")
+            else:
+                r.add("FAIL" if name == "omarchy-wm" else "WARN", f"bin.{name}", f"{f} missing or not executable")
+        log = STATE_DIR / "dispatch.log"
+        lines = read_tail(log, 20_000)[-50:]
+        if not lines:
+            r.add("INFO", "dispatch.log", "empty or missing (no KB/HS dispatch yet)")
+            return
+        lines = [ln for ln in lines if " DRY " not in ln]
+        bad = [ln for ln in lines if re.search(r"\brc=([1-9]\d*)\s*$", ln)]
+        if bad:
+            r.add("WARN", "dispatch.log", f"{len(bad)}/{len(lines)} recent calls non-zero, last: {bad[-1][:140]}")
+        else:
+            r.add("PASS", "dispatch.log", f"last {len(lines)} calls exit 0")
+
+    # ---- hammerspoon
+    def hammerspoon(self) -> None:
+        r = self.r
+        hsdir = HOME / ".hammerspoon"
+        if (hsdir / "omarchy/super.lua").exists():
+            r.add("WARN", "hs.super.lua", "old event-tap Super (super.lua) still present")
+        if (hsdir / "omarchy/generated/bindings.lua").exists():
+            r.add("PASS", "hs.generated", "omarchy/generated/bindings.lua present")
+        else:
+            r.add("FAIL", "hs.generated", "~/.hammerspoon/omarchy/generated/bindings.lua missing")
+        if self.a.no_hs_diag:
+            r.add("SKIP", "hs.diag", "--no-hs-diag")
+            return
+        if not self.hs_up:
+            r.add("FAIL", "hs.diag", "Hammerspoon not running")
+            return
+        diag = STATE_DIR / "diag.json"
+        try:
+            before = diag.stat().st_mtime
+        except OSError:
+            before = 0.0
+        start = time.time()
+        rc, _, err = run([OPEN, "-g", "hammerspoon://omarchy?a=diag&x=quiet"], timeout=5)
+        if rc != 0:
+            r.add("FAIL", "hs.diag", f"open failed: {err.strip()[:100]}")
+            return
+        data = None
+        while time.time() - start < 3.0:
+            try:
+                st = diag.stat().st_mtime
+                if st > before and st >= start - 1:
+                    time.sleep(0.05)
+                    data = json.loads(diag.read_text())
+                    break
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.1)
+        if data is None:
+            r.add("FAIL", "hs.diag", "no fresh diag.json within 3 s (omarchy URL handler not loaded?)")
+            return
+        r.add("PASS", "hs.diag", f"answered in {time.time() - start:.2f}s")
+        n = None
+        for k in ("hotkeys", "hotkeyCount", "hotkey_count", "nHotkeys"):
+            if k in data:
+                v = data[k]
+                n = v if isinstance(v, int) else len(v) if isinstance(v, (list, dict)) else None
+                break
+        if n is None:
+            r.add("WARN", "hs.diag.hotkeys", f"no hotkey count in diag.json (keys: {', '.join(list(data)[:12])})")
+        else:
+            r.add("PASS" if n > 0 else "FAIL", "hs.diag.hotkeys", f"{n} hs.hotkey bindings registered")
+        mods = None
+        for k in ("modifiers", "mods", "flags", "heldModifiers"):
+            if k in data:
+                mods = data[k]
+                break
+        held = []
+        if isinstance(mods, dict):
+            # hs.eventtap.checkKeyboardModifiers(true) adds "_raw" (integer flags); ignore private keys
+            held = [k for k, v in mods.items() if v and not str(k).startswith("_") and k not in ("capslock",)]
+        elif isinstance(mods, list):
+            held = [str(x) for x in mods]
+        elif isinstance(mods, str) and mods not in ("", "none"):
+            held = [mods]
+        if mods is None:
+            r.add("WARN", "hs.diag.modifiers", "diag.json has no modifiers field")
+        elif held:
+            r.add("WARN", "hs.diag.modifiers", f"Hammerspoon sees held modifiers: {', '.join(held)} (stuck?)")
+        else:
+            r.add("PASS", "hs.diag.modifiers", "no modifiers held")
+        for k in ("secureInput", "secure_input"):
+            if k in data:
+                r.add("INFO", "hs.diag.secureInput", json.dumps(data[k])[:120])
+                break
+        st = data.get("scrollTap")
+        if isinstance(st, dict) and "enabled" in st:
+            r.add("PASS" if st.get("enabled") else "WARN", "hs.diag.scrollTap",
+                  "Super+scroll tap enabled" if st.get("enabled") else "Super+scroll tap disabled")
+        for k in ("errors", "lastError", "hotkeyFailures"):
+            if data.get(k):
+                r.add("WARN", f"hs.diag.{k}", json.dumps(data[k])[:200])
+
+    # ---- theme
+    def theme(self) -> None:
+        r = self.r
+        cur = OM_DIR / "current"
+        tn = cur / "theme.name"
+        try:
+            name = tn.read_text().strip()
+        except OSError:
+            r.add("FAIL", "theme.name", f"{tn} missing")
+            return
+        if not name:
+            r.add("FAIL", "theme.name", "empty")
+            return
+        tdir = OM_DIR / "themes" / name
+        r.add("PASS" if tdir.is_dir() else "FAIL", "theme.name", f"{name}" + ("" if tdir.is_dir() else f" (no {tdir})"))
+        cj = cur / "colors.json"
+        try:
+            colors = json.loads(cj.read_text())
+            missing = [k for k in ("accent", "background", "foreground") if not re.fullmatch(
+                r"#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?", str(colors.get(k, "")))]
+            if missing:
+                r.add("FAIL", "theme.colors.json", f"missing/invalid: {', '.join(missing)}")
+            else:
+                r.add("PASS", "theme.colors.json", f"{len(colors)} keys, accent {colors['accent']}, mode {colors.get('mode', '?')}")
+        except (OSError, json.JSONDecodeError) as e:
+            r.add("FAIL", "theme.colors.json", str(e)[:120])
+            return
+        try:
+            if tn.stat().st_mtime + 1 < cj.stat().st_mtime:
+                r.add("WARN", "theme.write-order", "theme.name is older than colors.json (must be written last)")
+        except OSError:
+            pass
+        gc = cur / "ghostty.conf"
+        r.add("PASS" if gc.exists() else "WARN", "theme.ghostty.conf", str(gc) if gc.exists() else "missing")
+        lock = STATE_DIR / "theme.lock"
+        if lock.exists():
+            age = time.time() - lock.stat().st_mtime
+            if age > 120 and lock.stat().st_size > 0:
+                r.add("INFO", "theme.lock", f"lock file present ({age:.0f}s old)")
+
+    # ---- ghostty
+    def ghostty(self) -> None:
+        r = self.r
+        cfgs = [Path(self.a.ghostty_config).expanduser()] if self.a.ghostty_config else [HOME / ".config/ghostty/config"]
+        if not Path(GHOSTTY).exists():
+            r.add("WARN", "ghostty.validate", f"{GHOSTTY} missing")
+            return
+        for cfg in cfgs:
+            if not cfg.exists():
+                r.add("WARN", "ghostty.config", f"{cfg} missing")
+                continue
+            # NOTE: '--config-file=<path>' (with '=') is required; the space form is ignored.
+            rc, out, err = run([GHOSTTY, "+validate-config", f"--config-file={cfg}"], timeout=15)
+            msg = (out + err).strip()
+            if rc == 0 and not msg:
+                r.add("PASS", "ghostty.validate", f"{cfg} valid")
+            else:
+                r.add("FAIL", "ghostty.validate", f"rc={rc} " + " | ".join(msg.splitlines()[:4])[:300])
+
+    # ---- login items
+    def login_items(self) -> None:
+        r = self.r
+        want = {
+            "OmniWM": ("2.com.barut.OmniWM", "FAIL"),
+            "Hammerspoon": ("2.org.hammerspoon.Hammerspoon", "FAIL"),
+            "Karabiner": ("org.pqrs.service", "FAIL"),
+            "Maccy": ("Maccy", "WARN"),
+        }
+        if self.a.no_login_items:
+            r.add("SKIP", "login", "--no-login-items")
+            return
+        out, rc, source = "", 127, "live"
+        cache = STATE_DIR / "btm-cache.txt"
+        if self._btm is not None:
+            budget = max(1.0, self.a.btm_timeout - (time.time() - self._btm_t0))
+            try:
+                out, _ = self._btm.communicate(timeout=budget)
+                rc = self._btm.returncode
+            except subprocess.TimeoutExpired:
+                self._btm.kill()
+                try:
+                    self._btm.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                rc = 124
+        if rc == 0 and "Records for UID" in out:
+            try:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                cache.write_text(out)
+            except OSError:
+                pass
+        elif cache.exists() and time.time() - cache.stat().st_mtime < 7 * 86400:
+            age = (time.time() - cache.stat().st_mtime) / 3600
+            why = f"sfltool rc={rc} (124=timeout)" if self.a.login_sfltool else "sfltool not run (needs --login-sfltool)"
+            r.add("INFO", "login.sfltool", f"{why}; using cached dump from {age:.1f} h ago")
+            out, rc, source = cache.read_text(), 0, "cache"
+        if rc == 0 and "Records for UID" in out:
+            items = self._parse_btm(out)
+            for label, (ident, level) in want.items():
+                if label == "Karabiner":
+                    hits = [i for i in items if ident in i.get("Identifier", "") and
+                            ("Core-Service" in i.get("Identifier", "") or "Console-User-Server" in i.get("Identifier", ""))]
+                elif label == "Maccy":
+                    hits = [i for i in items if "maccy" in (i.get("Identifier", "") + i.get("Name", "")).lower()]
+                else:
+                    hits = [i for i in items if i.get("Identifier") == ident]
+                if not hits:
+                    r.add(level, f"login.{label.lower()}", "no login item registered")
+                    continue
+                enabled = [h for h in hits if self._btm_enabled(h.get("Disposition", ""))]
+                if len(enabled) == len(hits):
+                    r.add("PASS", f"login.{label.lower()}", f"enabled ({len(hits)} item{'s' if len(hits) > 1 else ''})"
+                          + (" [cached]" if source == "cache" else ""))
+                elif enabled:
+                    dis = [h.get("Name", "?") for h in hits if h not in enabled]
+                    r.add("WARN", f"login.{label.lower()}", f"partly enabled; disabled: {', '.join(dis)}")
+                else:
+                    r.add(level, f"login.{label.lower()}", f"DISABLED: {hits[0].get('Disposition', '')} "
+                          "(System Settings > General > Login Items)")
+            return
+        # Fallback. sfltool needs no sudo on 27.0 but can hang for minutes when the BTM daemon is busy.
+        # launchd only proves an SMAppService job is *registered*, not that the login item is enabled,
+        # so fallback results are never PASS-by-launchd. System Events can raise an Automation (TCC)
+        # prompt, which --static must not cause, so it only runs with --login-osascript.
+        if self.a.login_sfltool:
+            r.add("WARN", "login.sfltool", f"sfltool dumpbtm failed (rc={rc}, 124=timeout); fallback checks only")
+        else:
+            r.add("INFO", "login.sfltool", "exact check needs --login-sfltool (may show an admin password dialog)")
+        names: list[str] = []
+        if self.a.login_osascript:
+            rc2, out2, _ = run(["/usr/bin/osascript", "-e",
+                                'tell application "System Events" to get the name of every login item'], timeout=8)
+            names = [x.strip() for x in out2.split(",")] if rc2 == 0 else []
+        rc3, out3, _ = run(["/bin/launchctl", "print", f"gui/{os.getuid()}"], timeout=8)
+        jobs = out3.lower() if rc3 == 0 else ""
+        for label, (ident, level) in want.items():
+            if any(label.lower() in n.lower() for n in names):
+                r.add("PASS", f"login.{label.lower()}", "listed in System Events login items")
+                continue
+            key = {"OmniWM": "com.barut.omniwm", "Hammerspoon": "org.hammerspoon", "Karabiner": "org.pqrs.service",
+                   "Maccy": "maccy"}[label]
+            reg = key in jobs
+            r.add("WARN", f"login.{label.lower()}",
+                  ("launchd job registered; " if reg else "no launchd job; ") +
+                  "enabled state unverified (System Settings > General > Login Items"
+                  + ("" if self.a.login_osascript else ", or rerun with --login-osascript") + ")")
+
+    @staticmethod
+    def _btm_enabled(disp: str) -> bool:
+        m = re.search(r"\[([^\]]*)\]", disp)
+        toks = [t.strip() for t in m.group(1).split(",")] if m else []
+        return "enabled" in toks and "disallowed" not in toks
+
+    @staticmethod
+    def _parse_btm(text: str) -> list[dict]:
+        uid = os.getuid()
+        items: list[dict] = []
+        cur_uid = None
+        cur: dict | None = None
+        for line in text.splitlines():
+            m = re.match(r"\s*Records for UID (-?\d+)", line)
+            if m:
+                cur_uid = int(m.group(1))
+                continue
+            if re.match(r"\s*#\d+:\s*$", line):
+                cur = {"uid": cur_uid}
+                items.append(cur)
+                continue
+            if cur is not None and ":" in line:
+                k, _, v = line.strip().partition(":")
+                cur.setdefault(k.strip(), v.strip())
+        # user records first; system (-2 / 0) daemons count too for Karabiner
+        return [i for i in items if i.get("uid") in (uid, -2, 0)]
+
+
+# --------------------------------------------------------------------------- interactive
+
+class Interactive:
+    def __init__(self, rep: Report, args: argparse.Namespace):
+        self.r = rep
+        self.a = args
+        self.timeout = args.timeout
+        self.home: dict | None = None
+        self.secure = False
+        self.carbon = None
+
+    # -- ui helpers
+    def chime(self, ok: bool) -> None:
+        if self.a.no_sound:
+            return
+        snd = "/System/Library/Sounds/Glass.aiff" if ok else "/System/Library/Sounds/Basso.aiff"
+        try:
+            subprocess.Popen(["/usr/bin/afplay", "-v", "0.6", snd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+    def say(self, text: str) -> None:
+        print(f"\n{col('bold', '>>')} {text}", flush=True)
+
+    def ask(self, question: str) -> str:
+        while True:
+            try:
+                ans = input(f"   {question} [y/n/s=skip] ").strip().lower()
+            except EOFError:
+                return "s"
+            if ans in ("y", "n", "s", "yes", "no", "skip"):
+                return ans[0]
+
+    def wait_for(self, pred, timeout: float | None = None) -> tuple[bool, bool]:
+        """Poll pred() until true. Returns (ok, skipped). Enter on stdin skips."""
+        deadline = time.time() + (timeout or self.timeout)
+        while time.time() < deadline:
+            try:
+                if pred():
+                    return True, False
+            except Exception:
+                pass
+            if sys.stdin.isatty():
+                rl, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rl:
+                    sys.stdin.readline()
+                    return False, True
+            else:
+                time.sleep(0.1)
+        return False, False
+
+    def step(self, name: str, prompt: str, pred, fail_hint: str = "") -> bool:
+        self.say(prompt + col("SKIP", f"   (watching {self.timeout:.0f}s; Enter = skip)"))
+        t0 = time.time()
+        ok, skipped = self.wait_for(pred)
+        if skipped:
+            self.r.add("SKIP", name, "skipped by user")
+            return False
+        self.chime(ok)
+        self.r.add("PASS" if ok else "FAIL", name,
+                   f"detected after {time.time() - t0:.1f}s" if ok else f"not detected in {self.timeout:.0f}s. {fail_hint}")
+        return ok
+
+    def ws_is(self, n) -> bool:
+        a = active_workspace()
+        return bool(a) and a.get("number") == n
+
+    # -- secure input
+    def enable_secure(self) -> bool:
+        try:
+            self.carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
+            self.carbon.EnableSecureEventInput.restype = ctypes.c_int32
+            self.carbon.DisableSecureEventInput.restype = ctypes.c_int32
+            self.carbon.IsSecureEventInputEnabled.restype = ctypes.c_ubyte
+        except (OSError, AttributeError) as e:
+            self.r.add("FAIL", "secure.enable", f"cannot load Carbon: {e}")
+            return False
+        st = self.carbon.EnableSecureEventInput()
+        self.secure = True
+        time.sleep(0.3)
+        pids = secure_input_pids()
+        mine = os.getpid() in pids
+        self.r.add("PASS" if (st == 0 and mine) else ("WARN" if st == 0 else "FAIL"), "secure.enable",
+                   f"EnableSecureEventInput()={st}; ioreg kCGSSessionSecureInputPID={pids or 'none'} (self={os.getpid()})")
+        return st == 0
+
+    def disable_secure(self) -> None:
+        if self.secure and self.carbon is not None:
+            try:
+                st = self.carbon.DisableSecureEventInput()
+                self.secure = False
+                time.sleep(0.2)
+                left = secure_input_pids()
+                self.r.add("PASS" if os.getpid() not in left else "WARN", "secure.disable",
+                           f"DisableSecureEventInput()={st}; holders now: {left or 'none'}")
+            except Exception as e:
+                self.r.add("WARN", "secure.disable", f"error: {e} (exiting the process releases it anyway)")
+
+    # -- flows
+    def pick_other(self) -> int | None:
+        home = self.home
+        wss = list_workspaces()
+        same = [w for w in wss if (w.get("display") or {}).get("id") == home.get("display_id")
+                and w.get("number") not in (None, home["number"])]
+        if not same:
+            return None
+        # prefer workspace 2, then the emptiest low number
+        for w in same:
+            if w.get("number") == 2:
+                return 2
+        same.sort(key=lambda w: ((w.get("counts") or {}).get("total", 0), w.get("number")))
+        return same[0]["number"]
+
+    def workspace_tests(self, prefix: str) -> None:
+        home = self.home["number"]
+        other = self.pick_other()
+        if other is None:
+            self.r.add("SKIP", f"{prefix}.workspace", "no second workspace on this display")
+            return
+        self.say(f"Workspace tests: you will jump to workspace {other} and back to {home} (this terminal lives on {home}).\n"
+                 f"   A chime confirms each step, so you can press the next chord without seeing this window.\n"
+                 f"   Sequence: SUPER+{other}, SUPER+{home}, SUPER+CTRL+TAB, SUPER+CTRL+TAB")
+        self.step(f"{prefix}.super+{other}", f"Press SUPER+{other} now (hold Caps Lock, press {other})",
+                  lambda: self.ws_is(other), "OmniWM native hotkey path (OW) did not fire.")
+        self.step(f"{prefix}.super+{home}", f"Press SUPER+{home} now (back here)",
+                  lambda: self.ws_is(home), "OmniWM native hotkey path (OW) did not fire.")
+        self.step(f"{prefix}.super+ctrl+tab", "Press SUPER+CTRL+TAB (hold Caps + LEFT Ctrl, press Tab): back-and-forth",
+                  lambda: self.ws_is(other), "Karabiner shell_command path (KB -> omarchy-wm) did not fire; see dispatch.log.")
+        self.step(f"{prefix}.super+ctrl+tab.2", "Press SUPER+CTRL+TAB again (returns here)",
+                  lambda: self.ws_is(home), "")
+        self.restore()
+
+    def ghostty_tests(self) -> None:
+        before = {w.get("id") for w in window_ids(GHOSTTY_BUNDLE)}
+        new: dict = {}
+
+        def appeared() -> bool:
+            now = {w.get("id") for w in window_ids(GHOSTTY_BUNDLE)}
+            diff = now - before
+            if diff:
+                new["id"] = sorted(diff)[0]
+                return True
+            return False
+
+        if not self.step("interactive.super+return", "Press SUPER+RETURN: a new Ghostty window should open",
+                         appeared, "Hammerspoon 'terminal' action did not open a window."):
+            return
+        wid = new["id"]
+        self.say("Make sure the NEW Ghostty window is focused (click it if needed). "
+                 "The doctor will only ask for SUPER+W once it sees that window focused.")
+        ok, skipped = self.wait_for(lambda: focused_window_id() == wid)
+        if not ok:
+            self.r.add("SKIP", "interactive.super+w", "new Ghostty window never became focused; close it yourself (safety)")
+            return
+        self.step("interactive.super+w", "Press SUPER+W now: the new Ghostty window should close",
+                  lambda: wid not in {w.get("id") for w in window_ids(GHOSTTY_BUNDLE)},
+                  "close-window binding (OW closeFocusedWindow) did not fire.")
+
+    def manual_tests(self) -> None:
+        self.say("Press SUPER+SPACE: the Omarchy menu should appear. Press Esc to close it, then answer here.")
+        a = self.ask("Did the Omarchy menu open?")
+        self.r.add({"y": "PASS", "n": "FAIL", "s": "SKIP"}[a], "interactive.super+space", "user answer")
+
+        home = self.home["number"]
+        self.say("SUPER+SCROLL: hold Caps Lock and scroll ONE notch (either direction) over any window.")
+        moved = self.step("interactive.super+scroll", "Scroll now…",
+                          lambda: (lambda w: bool(w) and w.get("number") != home)(active_workspace()),
+                          "Hammerspoon scroll tap did not switch workspace.")
+        if moved:
+            self.step("interactive.super+scroll.back", f"Now hold Caps and scroll ONE notch the other way (back to {home})",
+                      lambda: self.ws_is(home), "")
+            self.restore()
+
+        self.say("SUPER+LEFT-DRAG: hold Caps Lock, press the LEFT mouse button inside a window (not its title bar) and drag.")
+        a = self.ask("Did the window move?")
+        self.r.add({"y": "PASS", "n": "FAIL", "s": "SKIP"}[a], "interactive.super+drag.move", "user answer")
+        self.say("SUPER+RIGHT-DRAG: hold Caps Lock, press the RIGHT mouse button inside a tiled window and drag.")
+        a = self.ask("Did the window resize?")
+        self.r.add({"y": "PASS", "n": "FAIL", "s": "SKIP"}[a], "interactive.super+drag.resize", "user answer")
+
+    def stuck_modifier_test(self) -> bool:
+        self.say("Stuck-modifier test: HOLD Caps Lock now and keep holding it (press nothing else).")
+        ok, skipped = self.wait_for(lambda: ((hid_flags() or 0) & SUPER_FLAGS) == SUPER_FLAGS)
+        if not ok:
+            self.r.add("SKIP" if skipped else "FAIL", "secure.stuck-mods",
+                       "skipped" if skipped else "never saw Ctrl+Opt+Cmd held (Karabiner Caps rule not active?)")
+            return False
+        enabled = self.enable_secure()
+        self.say("Secure Input is ON. RELEASE Caps Lock now.")
+        ok, _ = self.wait_for(lambda: ((hid_flags() or 0) & SUPER_FLAGS) == 0, timeout=8)
+        self.chime(ok)
+        self.r.add("PASS" if ok else "FAIL", "secure.stuck-mods",
+                   "modifiers released cleanly under Secure Input" if ok else
+                   f"still held: {flags_str((hid_flags() or 0) & SUPER_FLAGS)}")
+        return enabled
+
+    def restore(self) -> None:
+        if not self.home:
+            return
+        a = active_workspace()
+        if a and a.get("number") != self.home["number"]:
+            omni_cmd(["switch-workspace", str(self.home["number"])])
+
+    def run(self, secure_mode: bool) -> None:
+        r = self.r
+        if not sys.stdin.isatty():
+            r.add("FAIL", "interactive", "needs a terminal (stdin is not a TTY)")
+            return
+        rc, out, _ = run([OMNIWMCTL, "ping"], timeout=5)
+        if rc != 0 or "pong" not in out:
+            r.add("FAIL", "interactive", "OmniWM is not answering; start it first")
+            return
+        self.home = active_workspace()
+        if not self.home:
+            r.add("FAIL", "interactive", "cannot read the active workspace")
+            return
+        print(col("bold", "\nomarchy-doctor interactive key-path test"))
+        print("  Close or move away from patient-facing windows first. The doctor never reads window titles\n"
+              "  or the screen; it only watches workspace numbers and window ids. Ctrl+C aborts and restores.")
+        try:
+            input("  Press Enter to start… ")
+        except EOFError:
+            return
+        log_line(f"interactive start secure={secure_mode} home={self.home.get('number')}")
+        try:
+            if secure_mode:
+                r.section("Secure Input pass")
+                if not self.stuck_modifier_test():
+                    if not self.secure:
+                        self.enable_secure()
+                if self.secure:
+                    self.workspace_tests("secure")
+            else:
+                r.section("Interactive: native (OW) and Karabiner (KB) paths")
+                self.workspace_tests("interactive")
+                r.section("Interactive: Hammerspoon (HS) path")
+                self.ghostty_tests()
+                r.section("Interactive: menu, scroll, mouse")
+                self.manual_tests()
+        except KeyboardInterrupt:
+            r.add("SKIP", "interactive", "aborted with Ctrl+C")
+        finally:
+            self.disable_secure()
+            try:
+                self.restore()
+                a = active_workspace()
+                if a and self.home:
+                    r.add("PASS" if a.get("number") == self.home["number"] else "WARN", "interactive.restore",
+                          f"active workspace {a.get('number')} (original {self.home['number']})")
+            except Exception as e:
+                r.add("WARN", "interactive.restore", str(e))
+
+
+# --------------------------------------------------------------------------- main
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="omarchy-doctor",
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  omarchy-doctor                      # same as --static
+  omarchy-doctor --static --quiet     # only WARN/FAIL lines
+  omarchy-doctor --static --settings build/generated/settings.toml --karabiner build/generated/karabiner.json
+  omarchy-doctor --interactive        # press the keys it asks for
+  omarchy-doctor --secure-input       # same key tests with Secure Input forced on
+
+logs: ~/.local/state/omarchy-mac/doctor.log""")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--static", action="store_true", help="read-only checks (default)")
+    mode.add_argument("--interactive", action="store_true", help="guided key-path test (you press keys)")
+    mode.add_argument("--secure-input", action="store_true",
+                      help="key-path test with EnableSecureEventInput() active in this process")
+    ap.add_argument("--quiet", "-q", action="store_true", help="print only WARN and FAIL lines")
+    ap.add_argument("--json", action="store_true", help="print results as JSON")
+    ap.add_argument("--strict", action="store_true", help="exit 1 on WARN too")
+    ap.add_argument("--settings", metavar="PATH", help="check this OmniWM settings.toml instead of the live one")
+    ap.add_argument("--karabiner", metavar="PATH", help="check this karabiner.json instead of the live one (skips log/cli)")
+    ap.add_argument("--ghostty-config", metavar="PATH", help="validate this Ghostty config instead of ~/.config/ghostty/config")
+    ap.add_argument("--bin-dir", metavar="DIR", help="omarchy-mac bin dir (default ~/.config/omarchy-mac/bin); "
+                                                    "bindings.toml is read from DIR/../bindings.toml")
+    ap.add_argument("--hs-bindings", metavar="PATH",
+                    help="generated Hammerspoon bindings.lua to check (default ~/.hammerspoon/omarchy/generated/bindings.lua)")
+    ap.add_argument("--allow-niri", metavar="N,N", default="",
+                    help="workspace names allowed to be niri (env OMARCHY_DOCTOR_ALLOW_NIRI)")
+    ap.add_argument("--no-hs-diag", action="store_true", help="do not ping hammerspoon://omarchy?a=diag")
+    ap.add_argument("--no-login-items", action="store_true", help="skip the (slow) login item check")
+    ap.add_argument("--login-sfltool", action="store_true",
+                    help="exact login-item check via 'sfltool dumpbtm' (macOS may show an admin password dialog; "
+                         "the dump is cached for 7 days in ~/.local/state/omarchy-mac/btm-cache.txt)")
+    ap.add_argument("--btm-timeout", type=float, default=45.0, metavar="SEC",
+                    help="max seconds for 'sfltool dumpbtm' (default 45; cached result used on timeout)")
+    ap.add_argument("--login-osascript", action="store_true",
+                    help="fallback: ask System Events for login items (may show an Automation prompt once)")
+    ap.add_argument("--timeout", type=float, default=10.0, help="interactive: seconds to wait per step (default 10)")
+    ap.add_argument("--no-sound", action="store_true", help="interactive: no chimes")
+    args = ap.parse_args(argv)
+
+    if args.json:
+        global USE_COLOR
+        USE_COLOR = False
+    rep = Report(quiet=args.quiet, as_json=args.json)
+    mode_name = "interactive" if args.interactive else "secure-input" if args.secure_input else "static"
+    if not args.json:
+        print(col("bold", f"omarchy-doctor ({mode_name}) {_dt.datetime.now():%Y-%m-%d %H:%M:%S}"))
+    try:
+        if mode_name == "static":
+            Static(rep, args).all()
+        else:
+            Interactive(rep, args).run(secure_mode=args.secure_input)
+    except KeyboardInterrupt:
+        rep.add("SKIP", "doctor", "interrupted")
+    c = rep.counts()
+    failed = c["FAIL"] > 0 or (args.strict and c["WARN"] > 0)
+    summary = f"{c['PASS']} pass, {c['WARN']} warn, {c['FAIL']} fail, {c['SKIP']} skip"
+    log_line(f"{mode_name}: {summary}" + "".join(
+        f"\n    {x['status']} {x['check']}: {x['detail']}" for x in rep.results if x["status"] in ("FAIL", "WARN")))
+    if args.json:
+        print(json.dumps({"mode": mode_name, "summary": c, "ok": not failed, "results": rep.results}, indent=2,
+                         ensure_ascii=False))
+    else:
+        verdict = col("FAIL", "FAIL") if c["FAIL"] else col("WARN", "WARN") if c["WARN"] else col("PASS", "OK")
+        print(f"\n{col('bold', 'Summary:')} {summary} -> {verdict}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1139 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tomlkit>=0.13"]
+# ///
+"""omarchy-keys: generate every key binding output from bindings.toml.
+
+Usage:
+  omarchy-keys check    [--bindings F] [--settings F] [--karabiner F] [--offline]
+  omarchy-keys print    [--bindings F] [--settings F] [--offline]
+  omarchy-keys generate --out DIR [--bindings F] [--settings F] [--karabiner F]
+                        [--offline] [--diff]
+  omarchy-keys install  [--dry-run] [--only PART ...] [--bindings F] [--settings F]
+                        [--karabiner F]
+
+check     parse and validate bindings.toml (chords, duplicates, owners, every
+          'wm' command against 'omniwmctl query commands', every 'hs' action
+          against the Hammerspoon action list) and lint the Karabiner rules.
+print     print the final binding table: chord -> owner -> action.
+generate  write, into DIR (never into the live locations):
+            DIR/karabiner.json
+            DIR/settings.toml        live OmniWM settings + generated [[hotkeys]]
+                                     + the Omarchy settings (read-only on live)
+            DIR/hammerspoon/omarchy/generated/bindings.lua
+            DIR/KEYBINDINGS.md
+install   regenerate and deploy to the live locations (for re-runs after the
+          first cutover; the Omarchy menu's "Regenerate keybindings" uses it):
+            ~/.hammerspoon/omarchy/generated/bindings.lua   (atomic rename)
+            ~/.config/omniwm/settings.toml  merged again from the current live
+                file under the omarchy-omniwm-set lock, backup, atomic rename,
+                ping + corrupt-file check
+            ~/.config/karabiner/karabiner.json  (backup, atomic rename)
+            ~/.config/omarchy-mac/KEYBINDINGS.md
+          Backups of karabiner.json go to ~/.local/state/omarchy-mac/backups/
+          (newest 5). --dry-run prints what would change and writes nothing.
+          --only hammerspoon|settings|karabiner|docs (repeatable) installs just
+          those parts, in the order given, so a first cutover can follow its
+          own sequence. This is the safe way to deploy settings.toml: it is
+          re-merged onto the live file under the lock, so values OmniWM wrote
+          itself (Overview zoom, switcher scope ...) are kept.
+
+Defaults: --bindings <script dir>/../bindings.toml,
+          --settings ~/.config/omniwm/settings.toml (read only),
+          --karabiner ~/.config/karabiner/karabiner.json (read only; its
+          'devices' and 'virtual_hid_keyboard' sections are kept).
+--offline validates 'wm' commands against 'omniwmctl help' text only and
+skips the Karabiner lint if karabiner_cli is missing.
+
+Owners: OW = OmniWM native hotkey (Carbon), HS = Hammerspoon hs.hotkey,
+KB = Karabiner shell_command, KE = Karabiner key emission.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import difflib
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.parse
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import tomlkit
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)  # paths baked into generated files
+HOME = Path(os.environ.get("HOME", str(REAL_HOME)))  # paths we read from
+OMNIWMCTL = "/Applications/OmniWM.app/Contents/MacOS/omniwmctl"
+OPEN = "/usr/bin/open"
+KARABINER_CLI = "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
+OMARCHY_WM = str(REAL_HOME / ".config/omarchy-mac/bin/omarchy-wm")
+CITRIX_RE = r"^com\.citrix\.receiver\.icaviewer\.mac$"
+SUPER_VAR = "omarchy_super"
+TAP_TIMEOUT_MS = 500
+
+# Repeat bridge: a KB chord with repeat = true is served (outside Citrix Viewer)
+# by Karabiner emitting one of these otherwise unused chords, which Hammerspoon
+# binds with key repeat. (karabiner key_code, karabiner modifiers, hs key, hs mods)
+BRIDGE_SLOTS = [
+    (f"f{n}", ["left_control", "left_option", "left_command"] + (["left_shift"] if sh else []),
+     f"f{n}", ["ctrl", "alt", "cmd"] + (["shift"] if sh else []))
+    for sh in (False, True) for n in (16, 17, 18, 19)
+]
+
+HS_ACTIONS = {
+    "menu", "menu-system", "menu-theme", "menu-background", "menu-capture", "menu-toggle",
+    "menu-setup", "keybindings", "terminal", "browser", "browser-private", "finder", "tui",
+    "app", "webapp", "pop-out", "minimize", "toggle-gaps", "toggle-transparency",
+    "toggle-focus-follows-mouse", "screenshot-region", "screenshot-window", "screenrecord",
+    "color-picker", "stay-awake", "show-time", "show-battery", "notification-center", "agents",
+    "lock", "next-background", "wm", "diag", "reload",
+    # extensions defined by the Hammerspoon component (omarchy/actions.lua):
+    "settings",
+}
+HS_ARG_REQUIRED = {"tui", "app", "webapp", "wm", "settings"}
+
+# Settings the generator always writes into the merged settings.toml.
+INTENDED_SETTINGS = [
+    ("gestures.mouseMoveModifierKey", "controlOptionCommand"),
+    ("gestures.mouseResizeModifierKey", "controlOptionCommand"),
+    ("gestures.scrollModifierKey", "controlOptionCommandShift"),
+    ("general.systemHyperTrigger", "None"),
+    # Omarchy behaviour (user choice 2026-11-23): focus follows the mouse on movement; keyboard
+    # focus changes warp the pointer, like Hyprland. New windows/popups still take focus.
+    ("focus.followsMouse", True),
+    ("focus.moveMouseToFocusedWindow", True),
+    # Hover never focuses a partly visible Niri column (that scrolled/snapped the strip) and
+    # disables hover edge-scrolling (user, 2026-11-23).
+    ("focus.followsMouseOnlyFullyVisible", True),
+    ("mouseWarp.enabled", True),
+    ("workspaces[name=1].layoutType", "dwindle"),
+    ("windowSwitcher.optionTab", "disabled"),
+    # Global bar values aligned with omniwm-shell/shell.toml (which wins anyway).
+    # Single full-width Omarchy bar over the (auto-hidden) macOS menu bar; menu-bar extras are
+    # mirrored into it by the omarchy-tray widget + Hammerspoon omarchy/tray.lua (2026-11-23).
+    ("workspaceBar.position", "overlappingMenuBar"),
+    ("hiddenBar.enabled", False),
+    ("workspaceBar.height", 26.0),
+    ("workspaceBar.fullWidth", True),
+    ("workspaceBar.reserveLayoutSpace", True),
+    ("workspaceBar.backgroundOpacity", 1.0),
+]
+INTENDED_DELETES = ["launcher.entries[id=A1B2C3D4-4444-4444-8444-000000000004]"]  # 'hs -c' lock
+
+# ----------------------------------------------------------------------------- keys
+# name -> (omniwm key, hammerspoon key, karabiner key_code, display)
+KEYS: dict[str, tuple[str | None, str | None, str, str]] = {}
+for _c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    KEYS[_c] = (_c, _c.lower(), _c.lower(), _c)
+for _d in "0123456789":
+    KEYS[_d] = (_d, _d, _d, _d)
+KEYS.update({
+    "RETURN": ("Return", "return", "return_or_enter", "RETURN"),
+    "SPACE": ("Space", "space", "spacebar", "SPACE"),
+    "TAB": ("Tab", "tab", "tab", "TAB"),
+    "ESCAPE": ("Escape", "escape", "escape", "ESCAPE"),
+    "BACKSPACE": ("Delete", "delete", "delete_or_backspace", "BACKSPACE"),
+    "FORWARDDELETE": ("Forward Delete", "forwarddelete", "delete_forward", "DELETE"),
+    "LEFT": ("Left Arrow", "left", "left_arrow", "LEFT"),
+    "RIGHT": ("Right Arrow", "right", "right_arrow", "RIGHT"),
+    "UP": ("Up Arrow", "up", "up_arrow", "UP"),
+    "DOWN": ("Down Arrow", "down", "down_arrow", "DOWN"),
+    "MINUS": ("Minus", "-", "hyphen", "-"),
+    "EQUAL": ("Equal", "=", "equal_sign", "="),
+    "GRAVE": ("Grave", "`", "grave_accent_and_tilde", "`"),
+    "COMMA": ("Comma", ",", "comma", ","),
+    "PERIOD": ("Period", ".", "period", "."),
+    "SLASH": ("Slash", "/", "slash", "/"),
+    "BACKSLASH": ("Backslash", "\\", "backslash", "\\"),
+    "BRACKETLEFT": ("Left Bracket", "[", "open_bracket", "["),
+    "BRACKETRIGHT": ("Right Bracket", "]", "close_bracket", "]"),
+    "SEMICOLON": ("Semicolon", ";", "semicolon", ";"),
+    "APOSTROPHE": ("Quote", "'", "quote", "'"),
+    "HOME": ("Home", "home", "home", "HOME"),
+    "END": ("End", "end", "end", "END"),
+    "PAGEUP": ("Page Up", "pageup", "page_up", "PAGE UP"),
+    "PAGEDOWN": ("Page Down", "pagedown", "page_down", "PAGE DOWN"),
+    "PRINT": (None, None, "print_screen", "PRINT"),
+    # Media keys (bare only): Karabiner sees them as key_code or consumer_key_code depending
+    # on the keyboard, so manipulators are emitted for both. Routed so the Omarchy OSD port
+    # replaces the macOS volume/brightness HUD.
+    "VOLUMEUP": (None, None, "media:volume_increment", "VOLUME UP"),
+    "VOLUMEDOWN": (None, None, "media:volume_decrement", "VOLUME DOWN"),
+    "MUTE": (None, None, "media:mute", "MUTE"),
+    "BRIGHTNESSUP": (None, None, "media:display_brightness_increment", "BRIGHTNESS UP"),
+    "BRIGHTNESSDOWN": (None, None, "media:display_brightness_decrement", "BRIGHTNESS DOWN"),
+})
+MEDIA_KEYS = {"VOLUMEUP", "VOLUMEDOWN", "MUTE", "BRIGHTNESSUP", "BRIGHTNESSDOWN"}
+KEY_ALIASES = {
+    "ENTER": "RETURN", "ESC": "ESCAPE", "-": "MINUS", "=": "EQUAL", "`": "GRAVE", ",": "COMMA",
+    ".": "PERIOD", "/": "SLASH", "\\": "BACKSLASH", "[": "BRACKETLEFT", "]": "BRACKETRIGHT",
+    ";": "SEMICOLON", "'": "APOSTROPHE", "DELETE": "FORWARDDELETE", "PRINTSCREEN": "PRINT",
+}
+# Karabiner key codes that can never be bound but must still be swallowed in
+# every SUPER layer (function row, keypad, ISO / JIS keys, ...).
+GUARD_ONLY = ([f"f{i}" for i in range(1, 21)] + [f"keypad_{i}" for i in range(10)] + [
+    "keypad_enter", "keypad_hyphen", "keypad_plus", "keypad_period", "keypad_asterisk",
+    "keypad_slash", "keypad_equal_sign", "keypad_num_lock", "non_us_backslash", "non_us_pound",
+    "international1", "international2", "international3", "insert",
+])
+# (name or None, karabiner key_code): every key swallowed when unbound in a SUPER layer.
+GUARD_CODES = [(k, v[2]) for k, v in KEYS.items() if not v[2].startswith("media:")] + [(None, c) for c in GUARD_ONLY]
+MODS = ("SUPER", "SHIFT", "CTRL", "ALT")
+MOD_ALIASES = {"OPT": "ALT", "OPTION": "ALT", "CONTROL": "CTRL"}
+
+# Every SUPER layer (frozenset of extra modifiers).
+SUPER_LAYERS = [frozenset(s) for s in (
+    (), ("SHIFT",), ("CTRL",), ("ALT",), ("CTRL", "ALT"), ("SHIFT", "CTRL"), ("SHIFT", "ALT"),
+    ("SHIFT", "CTRL", "ALT"),
+)]
+
+# 'keys' emission: modifier words -> karabiner modifier names
+EMIT_MODS = {"cmd": "left_command", "command": "left_command", "ctrl": "left_control",
+             "control": "left_control", "opt": "left_option", "alt": "left_option",
+             "option": "left_option", "shift": "left_shift"}
+EMIT_KEYS = {k.lower(): v[2] for k, v in KEYS.items()}
+EMIT_KEYS.update({"space": "spacebar", "return": "return_or_enter", "enter": "return_or_enter",
+                  "-": "hyphen", "=": "equal_sign", "`": "grave_accent_and_tilde", ",": "comma",
+                  ".": "period", "/": "slash", "esc": "escape"})
+
+
+class BindError(Exception):
+    pass
+
+
+def load_omniwm_set():
+    p = SCRIPT_DIR / "omarchy-omniwm-set"
+    sys.dont_write_bytecode = True  # no __pycache__ next to the scripts
+    loader = importlib.machinery.SourceFileLoader("omarchy_omniwm_set", str(p))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# ----------------------------------------------------------------------------- model
+@dataclass(frozen=True)
+class Chord:
+    mods: frozenset
+    key: str
+
+    @property
+    def super(self) -> bool:
+        return "SUPER" in self.mods
+
+    @property
+    def extra(self) -> frozenset:
+        return self.mods - {"SUPER"}
+
+    def canonical(self) -> str:
+        return "+".join([m for m in MODS if m in self.mods] + [self.key])
+
+    def display(self) -> str:
+        return " + ".join([m for m in MODS if m in self.mods] + [KEYS[self.key][3]])
+
+
+@dataclass
+class Bind:
+    chord: Chord
+    raw_chord: str
+    desc: str
+    kind: str  # wm | wmx | hs | keys
+    value: str
+    arg: str | None
+    repeat: bool
+    group: str
+    line: int
+    owner: str = ""
+    ow_id: str | None = None
+    hs_action: str | None = None
+    hs_arg: str | None = None
+    citrix: bool = False
+    bridge: tuple | None = None  # BRIDGE_SLOTS entry (repeating KB chord)
+
+
+def parse_chord(s: str) -> Chord:
+    parts = [p.strip().upper() for p in s.split("+")]
+    if any(not p for p in parts):
+        raise BindError(f"bad chord {s!r}")
+    *mods, key = parts
+    mods = [MOD_ALIASES.get(m, m) for m in mods]
+    for m in mods:
+        if m not in MODS:
+            raise BindError(f"unknown modifier {m!r} in {s!r}")
+    if len(set(mods)) != len(mods):
+        raise BindError(f"repeated modifier in {s!r}")
+    key = KEY_ALIASES.get(key, key)
+    if key not in KEYS:
+        raise BindError(f"unknown key {key!r} in {s!r}")
+    if not mods and key != "PRINT" and key not in MEDIA_KEYS:
+        raise BindError(f"{s!r}: a bare key may not be bound (only PRINT and media keys)")
+    if mods and key in MEDIA_KEYS:
+        raise BindError(f"{s!r}: media keys can only be bound bare")
+    ch = Chord(frozenset(mods), key)
+    if {"CTRL", "ALT"} <= ch.mods and key in ("BACKSPACE", "FORWARDDELETE") and not ch.super:
+        raise BindError("Ctrl+Alt+Delete must never be bound (Citrix/Windows needs it)")
+    return ch
+
+
+def load_bindings(path: Path) -> list[Bind]:
+    text = path.read_text(encoding="utf-8")
+    data = tomllib.loads(text)
+    unknown_top = set(data) - {"bind"}
+    if unknown_top:
+        raise BindError(f"unknown top-level keys: {sorted(unknown_top)}")
+    lines = [i + 1 for i, l in enumerate(text.splitlines()) if l.strip() == "[[bind]]"]
+    out, group = [], "Other"
+    for i, b in enumerate(data.get("bind", [])):
+        ln = lines[i] if i < len(lines) else 0
+        where = f"bindings.toml:{ln}"
+        allowed = {"chord", "desc", "wm", "wmx", "hs", "arg", "keys", "repeat", "group"}
+        extra = set(b) - allowed
+        if extra:
+            raise BindError(f"{where}: unknown keys {sorted(extra)}")
+        if "chord" not in b or "desc" not in b:
+            raise BindError(f"{where}: chord and desc are required")
+        kinds = [k for k in ("wm", "wmx", "hs", "keys") if k in b]
+        if len(kinds) != 1:
+            raise BindError(f"{where} ({b['chord']}): exactly one of wm/wmx/hs/keys required, got {kinds}")
+        kind = kinds[0]
+        if "arg" in b and kind != "hs":
+            raise BindError(f"{where}: arg is only valid with hs")
+        group = b.get("group", group)
+        try:
+            ch = parse_chord(b["chord"])
+        except BindError as e:
+            raise BindError(f"{where}: {e}") from None
+        out.append(Bind(ch, b["chord"], b["desc"], kind, str(b[kind]).strip(), b.get("arg"),
+                        bool(b.get("repeat", False)), group, ln))
+    return out
+
+
+# ----------------------------------------------------------------------------- omniwm
+def _camel(words: list[str]) -> str:
+    toks = "-".join(words).split("-")
+    return toks[0] + "".join(t[:1].upper() + t[1:] for t in toks[1:])
+
+
+DIRS = ("left", "right", "up", "down")
+SPECIAL_IDS = {
+    "switch-workspace next": "switchWorkspace.next",
+    "switch-workspace prev": "switchWorkspace.previous",
+    "switch-workspace back-and-forth": "workspaceBackAndForth",
+    "move-to-workspace up": "moveWindowToWorkspaceUp",
+    "move-to-workspace down": "moveWindowToWorkspaceDown",
+    "focus-monitor prev": "focusMonitorPrevious",
+    "toggle-workspace-bar": "toggleWorkspaceBarVisibility",
+    "hidden-bar panel": "toggleHiddenBarPanel",
+    "resize-focused grow": "resizeFocusedWindow.grow",
+    "resize-focused shrink": "resizeFocusedWindow.shrink",
+}
+
+
+def cli_to_id(cli: str) -> str | None:
+    """Map an omniwmctl 'command' CLI form to an OmniWM hotkey action id."""
+    t = cli.split()
+    s = " ".join(t)
+    if s in SPECIAL_IDS:
+        return SPECIAL_IDS[s]
+    n = len(t)
+    if n == 2 and t[1] in DIRS:
+        table = {"focus": "focus", "move": "move", "move-column": "moveColumn",
+                 "move-to-monitor": "moveWindowToMonitor", "preselect": "preselect"}
+        if t[0] in table:
+            return f"{table[t[0]]}.{t[1]}"
+        return None
+    if n == 2 and t[1].isdigit():
+        k = int(t[1])
+        zero = {"switch-workspace": "switchWorkspace", "move-to-workspace": "moveToWorkspace",
+                "move-column-to-workspace": "moveColumnToWorkspace", "focus-column": "focusColumn"}
+        one = {"focus-window-in-column": "focusWindowInColumn", "move-column-to-index": "moveColumnToIndex"}
+        if t[0] in zero:
+            return f"{zero[t[0]]}.{k - 1}" if k >= 1 else None
+        if t[0] in one:
+            return f"{one[t[0]]}.{k}"
+        return None
+    if n == 3 and t[1] == "slot" and t[2].isdigit():
+        slot = {"switch-workspace": "switchWorkspaceSlot", "move-to-workspace": "moveToWorkspaceSlot"}
+        return f"{slot[t[0]]}.{t[2]}" if t[0] in slot else None
+    if n == 3 and t[0] == "scratchpad" and t[2].isdigit():
+        return {"toggle": f"toggleScratchpad.{t[2]}", "assign": f"assignFocusedWindowToScratchpad.{t[2]}"}.get(t[1])
+    if n == 3 and t[0] == "resize" and t[1] in ("horizontal", "vertical") and t[2] in ("grow", "shrink"):
+        return f"resize{t[2].capitalize()}.{t[1]}"
+    if n == 2 and t[0] == "open-command-palette":
+        return f"openCommandPalette.{t[1]}"
+    if n in (1, 2):
+        return _camel(t)
+    return None
+
+
+def load_settings(path: Path):
+    text = path.read_text(encoding="utf-8")
+    return text, tomlkit.parse(text)
+
+
+def hotkey_ids(doc) -> list[str]:
+    return [str(h["id"]) for h in doc.get("hotkeys", [])]
+
+
+def load_command_paths(offline: bool) -> tuple[list[list[str]], str]:
+    if not offline:
+        try:
+            r = subprocess.run([OMNIWMCTL, "query", "commands", "--format", "json"],
+                               capture_output=True, text=True, timeout=8)
+            d = json.loads(r.stdout)
+            paths = [c["path"].split()[1:] for c in d["result"]["payload"]["commands"]]
+            if paths:
+                return paths, "omniwmctl query commands"
+        except Exception:
+            pass
+    try:
+        r = subprocess.run([OMNIWMCTL, "help"], capture_output=True, text=True, timeout=8)
+        paths = [l.split()[2:] for l in r.stdout.splitlines() if l.strip().startswith("omniwmctl command ")]
+        if paths:
+            return paths, "omniwmctl help"
+    except Exception:
+        pass
+    raise BindError("cannot read the OmniWM command list (omniwmctl query commands / help both failed)")
+
+
+def _tok_ok(p: str, t: str) -> bool:
+    if p.startswith("<") and p.endswith(">"):
+        inner = p[1:-1]
+        if "|" in inner:
+            return t in inner.split("|")
+        if inner == "number":
+            return t.isdigit()
+        if inner == "size-change":
+            return re.fullmatch(r"[+-]?\d+(\.\d+)?%?", t) is not None
+        return bool(t)
+    return p == t
+
+
+def wm_valid(cli: str, paths: list[list[str]]) -> bool:
+    t = cli.split()
+    return any(len(p) == len(t) and all(_tok_ok(a, b) for a, b in zip(p, t)) for p in paths)
+
+
+SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_+\-%.]+$")
+
+
+def validate_wmx(s: str, paths) -> None:
+    t = s.split()
+    if not t:
+        raise BindError("empty wmx")
+    v, a = t[0], t[1:]
+    if not all(SAFE_TOKEN.match(x) for x in t):
+        raise BindError(f"wmx {s!r}: unsafe characters")
+    if v == "raw":
+        if not wm_valid(" ".join(a), paths):
+            raise BindError(f"wmx raw {' '.join(a)!r} is not an omniwmctl command")
+    elif v in ("move-follow", "move-silent"):
+        if len(a) != 1 or not a[0].isdigit() or not 1 <= int(a[0]) <= 9:
+            raise BindError(f"wmx {s!r}: needs a workspace number 1-9")
+    elif v == "resize":
+        if not (2 <= len(a) <= 3 and a[0] in "xy" and len(a[0]) == 1 and a[1] in ("-", "+")
+                and (len(a) == 2 or a[2] in ("fine", "coarse"))):
+            raise BindError(f"wmx {s!r}: resize <x|y> <-|+> [fine|coarse]")
+    elif v in ("fullwidth", "gaps-toggle"):
+        if a:
+            raise BindError(f"wmx {s!r}: takes no arguments")
+    elif v == "cycle-layout":
+        if a not in ([], ["reverse"]):
+            raise BindError(f"wmx {s!r}: cycle-layout [reverse]")
+    elif v == "ws-to-monitor":
+        if len(a) != 1 or a[0] not in DIRS:
+            raise BindError(f"wmx {s!r}: ws-to-monitor <left|right|up|down>")
+    else:
+        raise BindError(f"unknown omarchy-wm verb {v!r}")
+
+
+def parse_emit(s: str) -> tuple[str, list[str]]:
+    parts = [p.strip().lower() for p in s.split("+")]
+    *mods, key = parts
+    km = []
+    for m in mods:
+        if m not in EMIT_MODS:
+            raise BindError(f"keys {s!r}: unknown modifier {m!r}")
+        km.append(EMIT_MODS[m])
+    if key not in EMIT_KEYS:
+        raise BindError(f"keys {s!r}: unknown key {key!r}")
+    return EMIT_KEYS[key], km
+
+
+# ----------------------------------------------------------------------------- resolve
+def resolve(binds: list[Bind], ids: set[str], paths) -> list[str]:
+    """Validate and assign owners. Returns warnings."""
+    warnings: list[str] = []
+    seen: dict[Chord, Bind] = {}
+    for b in binds:
+        if b.chord in seen:
+            o = seen[b.chord]
+            raise BindError(f"duplicate chord {b.chord.canonical()} (bindings.toml:{o.line} and :{b.line})")
+        seen[b.chord] = b
+        if b.kind == "wm":
+            if not all(SAFE_TOKEN.match(x) for x in b.value.split()):
+                raise BindError(f"bindings.toml:{b.line}: wm {b.value!r} has unsafe characters")
+            if not wm_valid(b.value, paths):
+                raise BindError(f"bindings.toml:{b.line}: wm {b.value!r} is not an omniwmctl command")
+        elif b.kind == "wmx":
+            try:
+                validate_wmx(b.value, paths)
+            except BindError as e:
+                raise BindError(f"bindings.toml:{b.line}: {e}") from None
+        elif b.kind == "hs":
+            if b.value not in HS_ACTIONS:
+                raise BindError(f"bindings.toml:{b.line}: unknown Hammerspoon action {b.value!r}")
+            if b.value in HS_ARG_REQUIRED and not b.arg:
+                raise BindError(f"bindings.toml:{b.line}: hs {b.value!r} needs arg")
+            if b.value == "wm":
+                validate_wmx(b.arg, paths)
+        elif b.kind == "keys":
+            try:
+                parse_emit(b.value)
+            except BindError as e:
+                raise BindError(f"bindings.toml:{b.line}: {e}") from None
+
+    used_ids: set[str] = set()
+    bridges: list[Bind] = []
+    for b in binds:
+        ch = b.chord
+        b.citrix = ch.super
+        if b.kind == "keys":
+            b.owner = "KE"
+            continue
+        if ch.key == "PRINT" or ch.key in MEDIA_KEYS or (ch.super and ch.extra & {"CTRL", "ALT"}):
+            b.owner = "KB"
+            if b.repeat and ch.super:
+                if len(bridges) >= len(BRIDGE_SLOTS):
+                    raise BindError(f"{ch.canonical()}: no repeat-bridge slot left "
+                                    f"({len(BRIDGE_SLOTS)} max); drop repeat = true somewhere")
+                b.owner, b.bridge = "KE", BRIDGE_SLOTS[len(bridges)]
+                b.hs_action, b.hs_arg = hs_route(b)
+                bridges.append(b)
+            elif b.repeat:
+                warnings.append(f"{ch.canonical()}: repeat ignored (non-SUPER Karabiner chord)")
+            continue
+        if b.kind == "wm":
+            wid = cli_to_id(b.value)
+            if wid and wid in ids and wid not in used_ids:
+                b.owner, b.ow_id = "OW", wid
+                used_ids.add(wid)
+                continue
+            if wid and wid in used_ids:
+                warnings.append(f"{ch.canonical()}: OmniWM id {wid} already bound, using Hammerspoon")
+            elif not wid or wid not in ids:
+                warnings.append(f"{ch.canonical()}: no OmniWM hotkey id for {b.value!r}, using Hammerspoon")
+            b.owner, b.hs_action, b.hs_arg = "HS", "wm", f"raw {b.value}"
+        elif b.kind == "wmx":
+            b.owner, b.hs_action, b.hs_arg = "HS", "wm", b.value
+        else:
+            b.owner, b.hs_action, b.hs_arg = "HS", b.value, b.arg
+        if not ch.super and b.owner == "HS":
+            warnings.append(f"{ch.canonical()}: non-SUPER chord handled by Hammerspoon")
+    return warnings
+
+
+def hs_route(b: Bind) -> tuple[str, str | None]:
+    """The Hammerspoon action/arg that performs a wm / wmx / hs binding."""
+    if b.kind == "wm":
+        return "wm", f"raw {b.value}"
+    if b.kind == "wmx":
+        return "wm", b.value
+    return b.value, b.arg
+
+
+# ----------------------------------------------------------------------------- karabiner
+def hs_url(action: str, arg: str | None) -> str:
+    u = f"hammerspoon://omarchy?a={urllib.parse.quote(action, safe='')}"
+    if arg:
+        u += f"&x={urllib.parse.quote(arg, safe='')}"
+    return f'{OPEN} -g "{u}"'
+
+
+def kb_to(b: Bind, citrix: bool = False) -> list[dict]:
+    if b.bridge and not citrix:
+        key, mods = b.bridge[0], b.bridge[1]
+        return [{"key_code": key, "modifiers": list(mods)}]
+    if b.kind == "keys":
+        key, mods = parse_emit(b.value)
+        ev = {"key_code": key}
+        if mods:
+            ev["modifiers"] = mods
+        return [ev]
+    if b.kind == "wm":
+        cmd = f"{OMARCHY_WM} raw {b.value}"
+    elif b.kind == "wmx":
+        cmd = f"{OMARCHY_WM} {b.value}"
+    elif b.value == "wm":
+        cmd = f"{OMARCHY_WM} {b.arg}"
+    else:
+        cmd = hs_url(b.value, b.arg)
+    return [{"shell_command": cmd}]
+
+
+def super_mandatory(extra: frozenset) -> list[str]:
+    m = ["right_command", "right_option", "right_control"]
+    if "CTRL" in extra:
+        m.append("left_control")
+    if "ALT" in extra:
+        m.append("left_option")
+    if "SHIFT" in extra:
+        m.append("shift")
+    return m
+
+
+def citrix_mandatory(extra: frozenset) -> list[str]:
+    return [n for k, n in (("CTRL", "control"), ("ALT", "option"), ("SHIFT", "shift")) if k in extra]
+
+
+VAR_COND = {"type": "variable_if", "name": SUPER_VAR, "value": 1}
+CITRIX_IF = {"type": "frontmost_application_if", "bundle_identifiers": [CITRIX_RE]}
+CITRIX_UNLESS = {"type": "frontmost_application_unless", "bundle_identifiers": [CITRIX_RE]}
+
+
+def manip(key_code: str, mandatory: list[str] | None, to: list[dict], conds: list[dict],
+          optional: list[str] | None = None) -> dict:
+    frm: dict = {"key_code": key_code}
+    mods = {}
+    if mandatory:
+        mods["mandatory"] = mandatory
+    if optional:
+        mods["optional"] = optional
+    if mods:
+        frm["modifiers"] = mods
+    m = {"type": "basic", "from": frm, "to": to}
+    if conds:
+        m["conditions"] = conds
+    return m
+
+
+def layer_name(extra: frozenset) -> str:
+    return "+".join(["Super"] + [m.capitalize() for m in ("SHIFT", "CTRL", "ALT") if m in extra])
+
+
+def build_karabiner_rules(binds: list[Bind]) -> list[dict]:
+    rules = []
+    caps_set = {"set_variable": {"name": SUPER_VAR, "value": 1}}
+    caps_unset = [{"set_variable": {"name": SUPER_VAR, "value": 0}}]
+    rules.append({
+        "description": "Omarchy: hold Caps Lock = Super (right Cmd+Opt+Ctrl + omarchy_super); tap = Escape; "
+                       "Citrix Viewer: variable only, tap does nothing",
+        "manipulators": [
+            {"type": "basic", "conditions": [CITRIX_IF],
+             "from": {"key_code": "caps_lock", "modifiers": {"optional": ["any"]}},
+             "to": [caps_set], "to_after_key_up": caps_unset},
+            {"type": "basic",
+             "from": {"key_code": "caps_lock", "modifiers": {"optional": ["any"]}},
+             "to": [caps_set, {"key_code": "right_command", "modifiers": ["right_option", "right_control"]}],
+             "to_after_key_up": caps_unset,
+             "to_if_alone": [{"key_code": "escape"}],
+             "parameters": {"basic.to_if_alone_timeout_milliseconds": TAP_TIMEOUT_MS}},
+        ],
+    })
+
+    # Citrix Viewer: every SUPER binding through Karabiner, then swallow the rest.
+    cit = []
+    bound_citrix: set[tuple[frozenset, str]] = set()
+    for b in binds:
+        if not b.citrix:
+            continue
+        cit.append(manip(KEYS[b.chord.key][2], citrix_mandatory(b.chord.extra), kb_to(b, citrix=True),
+                         [CITRIX_IF, VAR_COND]))
+        bound_citrix.add((b.chord.extra, b.chord.key))
+    rules.append({"description": "Omarchy: Citrix Viewer, all Super bindings via Karabiner", "manipulators": cit})
+    rules.append({"description": "Omarchy: Citrix Viewer, swallow every other key while Super is held",
+                  "manipulators": [manip(code, None, [{"key_code": "vk_none"}], [CITRIX_IF, VAR_COND],
+                                         optional=["any"]) for _k, code in GUARD_CODES]})
+
+    # Normal mode: KB/KE layers, most specific first.
+    order = [frozenset(s) for s in (("SHIFT", "CTRL", "ALT"), ("SHIFT", "CTRL"), ("SHIFT", "ALT"),
+                                     ("CTRL", "ALT"), ("CTRL",), ("ALT",), ("SHIFT",), ())]
+    owned = {(b.chord.extra, b.chord.key): b for b in binds if b.chord.super}
+    for extra in order:
+        ms = []
+        for b in binds:
+            if b.chord.super and b.chord.extra == extra and b.owner in ("KB", "KE"):
+                ms.append(manip(KEYS[b.chord.key][2], super_mandatory(extra), kb_to(b), [VAR_COND]))
+        if ms:
+            rules.append({"description": f"Omarchy: {layer_name(extra)} layer (Karabiner)", "manipulators": ms})
+    # Guards: unbound keys in every Super layer do nothing.
+    for extra in order:
+        ms = []
+        for k, code in GUARD_CODES:
+            if k is not None and (extra, k) in owned:
+                continue
+            ms.append(manip(code, super_mandatory(extra), [{"key_code": "vk_none"}], [VAR_COND]))
+        rules.append({"description": f"Omarchy: {layer_name(extra)} layer, swallow unbound keys",
+                      "manipulators": ms})
+    # Non-Super Karabiner chords (PRINT etc.), never in Citrix Viewer.
+    ms = []
+    for b in binds:
+        if not b.chord.super and b.owner in ("KB", "KE"):
+            mand = [n for k, n in (("CTRL", "control"), ("ALT", "option"), ("SHIFT", "shift")) if k in b.chord.mods]
+            code = KEYS[b.chord.key][2]
+            if code.startswith("media:"):
+                for field in ("key_code", "consumer_key_code"):
+                    m = manip(code[6:], None, kb_to(b), [CITRIX_UNLESS], optional=["any"])
+                    m["from"] = {field: code[6:], "modifiers": {"optional": ["any"]}}
+                    ms.append(m)
+            else:
+                ms.append(manip(code, mand, kb_to(b), [CITRIX_UNLESS]))
+    if ms:
+        rules.append({"description": "Omarchy: non-Super keys (Print Screen, media keys)", "manipulators": ms})
+    return rules
+
+
+def build_karabiner_json(rules: list[dict], live_path: Path) -> dict:
+    live: dict = {}
+    try:
+        live = json.loads(live_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        pass
+    profiles = live.get("profiles", [])
+    src = next((p for p in profiles if p.get("selected")), profiles[0] if profiles else {})
+    glob = dict(live.get("global", {}))
+    glob.setdefault("show_in_menu_bar", True)
+    glob.setdefault("check_for_updates_on_startup", True)
+    prof: dict = {
+        "name": "Omarchy",
+        "selected": True,
+        "complex_modifications": {
+            "parameters": {"basic.to_if_alone_timeout_milliseconds": TAP_TIMEOUT_MS},
+            "rules": rules,
+        },
+    }
+    if src.get("devices"):
+        prof["devices"] = src["devices"]
+    prof["virtual_hid_keyboard"] = src.get("virtual_hid_keyboard", {"keyboard_type_v2": "ansi"})
+    return {"global": glob, "profiles": [prof]}
+
+
+def lint_rules(rules: list[dict], offline: bool) -> str:
+    if not os.path.exists(KARABINER_CLI):
+        if offline:
+            return "karabiner lint skipped (karabiner_cli not found)"
+        raise BindError(f"{KARABINER_CLI} not found")
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "omarchy-rules.json"
+        f.write_text(json.dumps({"title": "Omarchy (generated)", "rules": rules}, indent=2))
+        r = subprocess.run([KARABINER_CLI, "--lint-complex-modifications", str(f)],
+                           capture_output=True, text=True, timeout=60)
+        out = (r.stdout + r.stderr).strip()
+        if r.returncode != 0:
+            raise BindError(f"karabiner lint failed: {out[:2000]}")
+        return f"karabiner lint: {out.replace(str(f), 'rules')}"
+
+
+# ----------------------------------------------------------------------------- settings
+def ow_binding(ch: Chord) -> str:
+    parts = []
+    if ch.super or "CTRL" in ch.mods:
+        parts.append("Control")
+    if ch.super or "ALT" in ch.mods:
+        parts.append("Option")
+    if "SHIFT" in ch.mods:
+        parts.append("Shift")
+    if ch.super:
+        parts.append("Command")
+    return "+".join(parts + [KEYS[ch.key][0]])
+
+
+def build_settings(doc, binds: list[Bind], oset) -> list[str]:
+    """Mutate doc in place. Returns a list of change descriptions."""
+    changes = []
+    want = {b.ow_id: ow_binding(b.chord) for b in binds if b.owner == "OW"}
+    ids = set(hotkey_ids(doc))
+    missing = set(want) - ids
+    if missing:
+        raise BindError(f"OmniWM ids not in settings.toml: {sorted(missing)}")
+    for h in doc.get("hotkeys", []):
+        new = want.get(str(h["id"]), "Unassigned")
+        if str(h.get("binding")) != new:
+            changes.append(f"hotkeys[id={h['id']}].binding: {h.get('binding')!r} -> {new!r}")
+            h["binding"] = new
+    for path, val in INTENDED_SETTINGS:
+        old = oset._plain(oset.get_value(doc, path))
+        if oset.set_value(doc, path, val, parsed=True):
+            changes.append(f"{path}: {old!r} -> {val!r}")
+    for path in INTENDED_DELETES:
+        try:
+            oset.get_value(doc, path)
+        except oset.PathError:
+            continue
+        oset.delete_path(doc, path)
+        changes.append(f"deleted {path}")
+    return changes
+
+
+# ----------------------------------------------------------------------------- lua / md
+def lua_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def hs_mods(ch: Chord) -> list[str]:
+    m = []
+    if ch.super:
+        m = ["ctrl", "alt", "cmd"]
+    else:
+        m = [n for k, n in (("CTRL", "ctrl"), ("ALT", "alt")) if k in ch.mods]
+    if "SHIFT" in ch.mods:
+        m.append("shift")
+    return m
+
+
+def bridge_text(b: Bind) -> str:
+    return "+".join(b.bridge[3] + [b.bridge[2]])
+
+
+def target_text(b: Bind) -> str:
+    if b.owner == "OW":
+        return f"{b.ow_id}"
+    if b.bridge:
+        return f"emit {bridge_text(b)} -> hs:{b.hs_action}" + (f" {b.hs_arg}" if b.hs_arg else "")
+    if b.owner == "HS":
+        return f"hs:{b.hs_action}" + (f" {b.hs_arg}" if b.hs_arg else "")
+    if b.kind == "keys":
+        return f"emit {b.value}"
+    if b.kind == "wm":
+        return f"omarchy-wm raw {b.value}"
+    if b.kind == "wmx":
+        return f"omarchy-wm {b.value}"
+    if b.value == "wm":
+        return f"omarchy-wm {b.arg}"
+    return f"hs-url:{b.value}" + (f" {b.arg}" if b.arg else "")
+
+
+MOUSE_ROWS = [
+    ("SUPER+LMB", "SUPER + LEFT DRAG", "Move window", "OW", "mouseMoveModifierKey=controlOptionCommand"),
+    ("SUPER+RMB", "SUPER + RIGHT DRAG", "Resize window", "OW", "mouseResizeModifierKey=controlOptionCommand"),
+    ("SUPER+SCROLL", "SUPER + SCROLL", "Next / previous workspace", "HS", "scroll tap"),
+    ("SUPER+SHIFT+SCROLL", "SUPER + SHIFT + SCROLL", "Scroll columns (niri)", "OW",
+     "scrollModifierKey=controlOptionCommandShift"),
+]
+
+
+def hs_target(b: Bind) -> tuple[str | None, str | None]:
+    """The Hammerspoon action/arg a binding ends up running, if any (HS, or KB via URL)."""
+    if b.owner == "HS" or b.bridge:
+        return b.hs_action, b.hs_arg
+    if b.owner == "KB" and b.kind == "hs" and b.value != "wm":
+        return b.value, b.arg
+    return None, None
+
+
+def build_lua(binds: list[Bind]) -> str:
+    out = ["-- GENERATED by omarchy-keys from ~/.config/omarchy-mac/bindings.toml. Do not edit.",
+           "-- hotkeys: the chords Hammerspoon owns (bind each with hs.hotkey; rep = key repeat).",
+           "--          Entries with bridge = true are Ctrl+Opt+Cmd(+Shift)+F16..F19 chords that",
+           "--          Karabiner emits for repeating Super+Ctrl/Alt chords; chord is the user chord.",
+           "--          action/arg are names in omarchy/actions.lua (actions.run(action, arg)).",
+           "-- all:     every binding (all owners) for the SUPER+K viewer.",
+           "return {", "  version = 1,",
+           f"  generated = {lua_str(_dt.datetime.now().isoformat(timespec='seconds'))},", "  hotkeys = {"]
+    for b in binds:
+        if b.owner != "HS" and not b.bridge:
+            continue
+        if b.bridge:  # Karabiner emits this chord for a repeating Super+Ctrl/Alt chord
+            mods, key = b.bridge[3], b.bridge[2]
+        else:
+            mods, key = hs_mods(b.chord), KEYS[b.chord.key][1]
+        fields = [f"mods = {{{', '.join(lua_str(m) for m in mods)}}}",
+                  f"key = {lua_str(key)}", f"action = {lua_str(b.hs_action)}"]
+        if b.hs_arg:
+            fields.append(f"arg = {lua_str(b.hs_arg)}")
+        fields.append(f"rep = {'true' if b.repeat else 'false'}")
+        if b.bridge:
+            fields.append("bridge = true")
+        fields.append(f"chord = {lua_str(b.chord.canonical())}")
+        fields.append(f"desc = {lua_str(b.desc)}")
+        out.append("    { " + ", ".join(fields) + " },")
+    out += ["  },", "  all = {"]
+    for b in binds:
+        fields = [f"chord = {lua_str(b.chord.canonical())}", f"display = {lua_str(b.chord.display())}",
+                  f"desc = {lua_str(b.desc)}", f"group = {lua_str(b.group)}", f"owner = {lua_str(b.owner)}",
+                  f"target = {lua_str(target_text(b))}"]
+        act, arg = hs_target(b)
+        if act:
+            fields.append(f"action = {lua_str(act)}")
+            if arg:
+                fields.append(f"arg = {lua_str(arg)}")
+        out.append("    { " + ", ".join(fields) + " },")
+    for c, disp, desc, own, tgt in MOUSE_ROWS:
+        out.append("    { " + ", ".join([
+            f"chord = {lua_str(c)}", f"display = {lua_str(disp)}", f"desc = {lua_str(desc)}",
+            f"group = {lua_str('Mouse')}", f"owner = {lua_str(own)}", f"target = {lua_str(tgt)}"]) + " },")
+    out += ["  },", "}", ""]
+    return "\n".join(out)
+
+
+def md_chord(text: str) -> str:
+    t = text.replace("|", "\\|")
+    return f"`{t}`" if "`" not in t else f"`` {t} ``"
+
+
+def build_md(binds: list[Bind]) -> str:
+    groups: dict[str, list[Bind]] = {}
+    for b in binds:
+        groups.setdefault(b.group, []).append(b)
+    out = ["# Omarchy on macOS: key bindings", "",
+           "Generated by `omarchy-keys` from `~/.config/omarchy-mac/bindings.toml`. Do not edit by hand.", "",
+           "**SUPER** = hold Caps Lock (tap = Escape). **CTRL** / **ALT** inside a SUPER chord are the "
+           "physical *left* Control / Option keys. Owners: OW = OmniWM native, HS = Hammerspoon, "
+           "KB = Karabiner command, KE = Karabiner key emission (for the repeating SUPER+CTRL / SUPER+ALT "
+           "resize chords, Karabiner emits a bridge chord that Hammerspoon handles with key repeat). "
+           "Karabiner commands (KB) fire once per press; hold-to-repeat works for OW, HS and KE chords. "
+           "In Citrix Viewer every SUPER chord runs through Karabiner and fires once per press; "
+           "Ctrl+Alt+Delete and Alt+Tab are left for Windows.", ""]
+    for g, bs in groups.items():
+        out += [f"## {g}", "", "| Keys | Action | Owner |", "|---|---|---|"]
+        for b in bs:
+            out.append(f"| {md_chord(b.chord.display())} | {b.desc} | {b.owner} |")
+        out.append("")
+    out += ["## Mouse", "", "| Keys | Action | Owner |", "|---|---|---|"]
+    for _c, disp, desc, own, _t in MOUSE_ROWS:
+        out.append(f"| {md_chord(disp)} | {desc} | {own} |")
+    out.append("")
+    return "\n".join(out)
+
+
+# ----------------------------------------------------------------------------- main
+def pipeline(a) -> tuple[list[Bind], list[str], object, str, list, str, str]:
+    binds = load_bindings(a.bindings)
+    s_text, s_doc = load_settings(a.settings)
+    paths, src = load_command_paths(a.offline)
+    warnings = resolve(binds, set(hotkey_ids(s_doc)), paths)
+    rules = build_karabiner_rules(binds)
+    lint = lint_rules(rules, a.offline)
+    return binds, warnings, s_doc, s_text, rules, lint, src
+
+
+def summary(binds: list[Bind]) -> str:
+    c: dict[str, int] = {}
+    for b in binds:
+        c[b.owner] = c.get(b.owner, 0) + 1
+    return ", ".join(f"{k}={v}" for k, v in sorted(c.items())) + f", total={len(binds)}"
+
+
+def cmd_print(a) -> int:
+    binds = load_bindings(a.bindings)
+    _t, doc = load_settings(a.settings)
+    paths, _src = load_command_paths(a.offline)
+    resolve(binds, set(hotkey_ids(doc)), paths)
+    group = None
+    for b in binds:
+        if b.group != group:
+            group = b.group
+            print(f"\n## {group}")
+        print(f"{b.chord.canonical():26} {b.owner}  {target_text(b):48} {b.desc}")
+    print(f"\n{summary(binds)}")
+    return 0
+
+
+def cmd_check(a) -> int:
+    binds, warnings, _doc, _t, rules, lint, src = pipeline(a)
+    for w in warnings:
+        print(f"warning: {w}")
+    nman = sum(len(r["manipulators"]) for r in rules)
+    print(f"ok: {len(binds)} bindings ({summary(binds)}); wm commands checked against {src}; "
+          f"{len(rules)} Karabiner rules / {nman} manipulators; {lint}")
+    return 0
+
+
+def cmd_generate(a) -> int:
+    binds, warnings, doc, s_text, rules, lint, src = pipeline(a)
+    oset = load_omniwm_set()
+    changes = build_settings(doc, binds, oset)
+    new_settings = tomlkit.dumps(doc)
+    tomllib.loads(new_settings)
+    out: Path = a.out.expanduser().resolve()
+    live_roots = [HOME / ".config/omniwm", HOME / ".config/karabiner", HOME / ".hammerspoon"]
+    if any(out == r or r in out.parents for r in live_roots):
+        raise BindError(f"refusing to write into a live config directory: {out}")
+    (out / "hammerspoon/omarchy/generated").mkdir(parents=True, exist_ok=True)
+    kj = build_karabiner_json(rules, a.karabiner)
+
+    def write(p: Path, text: str):
+        tmp = p.with_name(f".{p.name}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, p)
+
+    write(out / "karabiner.json", json.dumps(kj, indent=4, ensure_ascii=False) + "\n")
+    write(out / "settings.toml", new_settings)
+    # The generated settings.toml is a snapshot merged onto the live file as it was
+    # now. 'omarchy-omniwm-set --install' refuses it if the live file changed since.
+    write(out / "settings.toml.source-sha256",
+          f"{hashlib.sha256(s_text.encode('utf-8')).hexdigest()}  {a.settings}\n")
+    write(out / "hammerspoon/omarchy/generated/bindings.lua", build_lua(binds))
+    write(out / "KEYBINDINGS.md", build_md(binds))
+
+    for w in warnings:
+        print(f"warning: {w}")
+    hk = [c for c in changes if c.startswith("hotkeys[")]
+    other = [c for c in changes if not c.startswith("hotkeys[")]
+    print(f"bindings: {summary(binds)} (wm commands checked against {src})")
+    print(f"karabiner: {len(rules)} rules, {sum(len(r['manipulators']) for r in rules)} manipulators; {lint}")
+    print(f"settings: {len(hk)} hotkey bindings set, {len(hotkey_ids(doc))} ids written; other changes:")
+    for c in other:
+        print(f"  {c}")
+    if a.diff:
+        sys.stdout.writelines(difflib.unified_diff(s_text.splitlines(True), new_settings.splitlines(True),
+                                                   str(a.settings), str(out / "settings.toml")))
+    print(f"wrote {out}/karabiner.json, settings.toml (+ .source-sha256), "
+          "hammerspoon/omarchy/generated/bindings.lua, KEYBINDINGS.md")
+    return 0
+
+
+def _atomic(p: Path, text: str, mode: int | None = None) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        mode = p.stat().st_mode & 0o777 if p.exists() else 0o644
+    fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".omarchy.tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _state_backup(p: Path, keep: int = 5) -> Path | None:
+    if not p.exists():
+        return None
+    d = HOME / ".local/state/omarchy-mac/backups"
+    d.mkdir(parents=True, exist_ok=True)
+    dst = d / f"{p.name}.{_dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+    dst.write_bytes(p.read_bytes())
+    for old in sorted(d.glob(f"{p.name}.*"))[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return dst
+
+
+def cmd_install(a) -> int:
+    binds, warnings, _doc, _t, rules, lint, src = pipeline(a)
+    for w in warnings:
+        print(f"warning: {w}")
+    oset = load_omniwm_set()
+    lua_p = HOME / ".hammerspoon/omarchy/generated/bindings.lua"
+    md_p = HOME / ".config/omarchy-mac/KEYBINDINGS.md"
+    kj_text = json.dumps(build_karabiner_json(rules, a.karabiner), indent=4, ensure_ascii=False) + "\n"
+    lua_text, md_text = build_lua(binds), build_md(binds)
+    print(f"bindings: {summary(binds)} (wm commands checked against {src}); {lint}")
+    parts = a.only or list(INSTALL_PARTS)
+    if a.dry_run:
+        for part in parts:
+            if part == "hammerspoon":
+                print(f"would write {lua_p}")
+            elif part == "settings":
+                _t2, doc = load_settings(a.settings)
+                changes = build_settings(doc, binds, oset)
+                print(f"would update {a.settings}: {len(changes)} change(s)")
+                for c in changes:
+                    print(f"  {c}")
+            elif part == "karabiner":
+                old_kj = a.karabiner.read_text(encoding="utf-8") if a.karabiner.exists() else ""
+                print(f"would write {a.karabiner} ({'unchanged' if old_kj == kj_text else 'changed'})")
+            else:
+                print(f"would write {md_p}")
+        return 0
+    for part in parts:
+        {"hammerspoon": lambda: _install_lua(lua_p, lua_text),
+         "settings": lambda: _install_settings(a, binds, oset),
+         "karabiner": lambda: _install_karabiner(a, kj_text),
+         "docs": lambda: _install_md(md_p, md_text)}[part]()
+    return 0
+
+
+# Default order: Hammerspoon first (its pathwatcher rebinds HS chords), then
+# OmniWM, then Karabiner (its file watcher reloads on rename), then the docs.
+INSTALL_PARTS = ("hammerspoon", "settings", "karabiner", "docs")
+
+
+def _install_lua(lua_p: Path, lua_text: str) -> None:
+    _atomic(lua_p, lua_text)
+    print(f"wrote {lua_p}")
+
+
+def _install_md(md_p: Path, md_text: str) -> None:
+    _atomic(md_p, md_text)
+    print(f"wrote {md_p}")
+
+
+def _install_settings(a, binds, oset) -> None:
+    # Re-merge onto the live file inside the settings lock.
+    with oset.Locked():
+        old = a.settings.read_text(encoding="utf-8")
+        doc = tomlkit.parse(old)
+        changes = build_settings(doc, binds, oset)
+        new = tomlkit.dumps(doc)
+        tomllib.loads(new)
+        if new != old:
+            before = oset.corrupt_files(a.settings.parent)
+            bak = oset.backup(a.settings, 5)
+            oset.atomic_write(a.settings, new)
+            oset.log(f"WROTE {a.settings} (omarchy-keys install, {len(changes)} changes) backup={bak.name}")
+            print(f"wrote {a.settings} ({len(changes)} changes, backup {bak.name})")
+            if oset.post_check(a.settings, before, bak, quiet=True):
+                raise BindError("OmniWM rejected the new settings.toml; the backup was restored")
+        else:
+            print(f"{a.settings}: unchanged")
+
+
+def _install_karabiner(a, kj_text: str) -> None:
+    old_kj = a.karabiner.read_text(encoding="utf-8") if a.karabiner.exists() else ""
+    if old_kj != kj_text:
+        bak = _state_backup(a.karabiner)
+        _atomic(a.karabiner, kj_text, mode=0o600)
+        print(f"wrote {a.karabiner}" + (f" (backup {bak})" if bak else ""))
+    else:
+        print(f"{a.karabiner}: unchanged")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="omarchy-keys", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("\n\n", 1)[1])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("check", "print", "generate", "install"):
+        p = sub.add_parser(name, formatter_class=argparse.RawDescriptionHelpFormatter)
+        p.add_argument("--bindings", type=Path, default=SCRIPT_DIR.parent / "bindings.toml")
+        p.add_argument("--settings", type=Path, default=HOME / ".config/omniwm/settings.toml")
+        p.add_argument("--karabiner", type=Path, default=HOME / ".config/karabiner/karabiner.json")
+        p.add_argument("--offline", action="store_true")
+        if name == "generate":
+            p.add_argument("--out", type=Path, required=True)
+            p.add_argument("--diff", action="store_true", help="print the full settings.toml diff")
+        if name == "install":
+            p.add_argument("--dry-run", action="store_true")
+            p.add_argument("--only", action="append", choices=INSTALL_PARTS, metavar="PART",
+                           help="install only this part (hammerspoon|settings|karabiner|docs); repeatable")
+    a = ap.parse_args(argv)
+    try:
+        return {"check": cmd_check, "print": cmd_print, "generate": cmd_generate, "install": cmd_install}[a.cmd](a)
+    except BindError as e:
+        print(f"omarchy-keys: error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

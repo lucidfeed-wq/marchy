@@ -1,0 +1,39 @@
+# Options for the omarchy-logo bar widget (values arrive in ctx.data.settings;
+# override them in shell.toml under [profiles.default.widgets.omarchy-logo]).
+
+[options.color]
+type = "string"
+title = "Logo color (palette role such as accent, or #RRGGBB)"
+default = "accent"
+maxLength = 32
+
+[options.size]
+type = "number"
+title = "Logo size (points)"
+default = 12
+min = 8
+max = 28
+step = 1
+
+[options.clickAction]
+type = "string"
+title = "Hammerspoon action on click"
+default = "menu"
+maxLength = 64
+
+[options.rightClickAction]
+type = "string"
+title = "Hammerspoon action on right-click"
+default = "terminal"
+maxLength = 64
+
+[options.secureInputLock]
+type = "boolean"
+title = "Show a lock while Secure Input is on"
+default = true
+
+[options.lockColor]
+type = "string"
+title = "Secure Input lock color"
+default = "red"
+maxLength = 32

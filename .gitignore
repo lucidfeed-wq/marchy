@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+tmp/
+generated/
+# converter working state (generated locally)
+omarchy-mac/port/out/
+omarchy-mac/port/specs/
+omarchy-mac/port/state.json
+omarchy-mac/port/sources.json
+omarchy-mac/port/marketplace.json

@@ -1,0 +1,40 @@
+# Ghostty, Omarchy style (managed by omarchy-mac).
+#
+# Colours: ~/.config/omarchy-mac/current/ghostty.conf is rewritten by
+# `omarchy-theme set <name>`, which then sends SIGUSR2 so every window reloads.
+# Overrides: ~/.config/omarchy-mac/current/ghostty-overrides.conf is written by
+# Hammerspoon (Super+Backspace transparency toggle). Ghostty loads config-file
+# entries after this file, in order, so the overrides win. The "?" makes a
+# missing file harmless.
+config-file = ?~/.config/omarchy-mac/current/ghostty.conf
+config-file = ?~/.config/omarchy-mac/current/ghostty-overrides.conf
+
+# Font (Omarchy's size 9 is Linux pixels; 14 is the Mac equivalent).
+font-family = JetBrainsMono Nerd Font
+font-style = Regular
+font-size = 14
+
+# Window
+window-padding-x = 14
+window-padding-y = 14
+window-padding-balance = true
+macos-titlebar-style = hidden
+macos-window-shadow = false
+window-save-state = never
+confirm-close-surface = false
+resize-overlay = never
+
+# Cursor: solid block, no blink (the shell must not change it either).
+cursor-style = block
+cursor-style-blink = false
+shell-integration-features = no-cursor,ssh-env
+
+# Input
+mouse-hide-while-typing = true
+macos-option-as-alt = true
+
+# Omarchy's terminal keys that are safe on macOS: Shift+Enter and
+# Alt+Shift+Enter as CSI-u, so TUIs (Claude Code, tmux, Neovim) can tell them
+# from Enter. Nothing here uses Ctrl+Option+Command (the Super chord).
+keybind = shift+enter=csi:13;2u
+keybind = alt+shift+enter=csi:13;4u

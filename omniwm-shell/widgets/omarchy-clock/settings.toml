@@ -1,0 +1,34 @@
+# Options for the omarchy-clock bar widget (values arrive in ctx.data.settings;
+# override in shell.toml under [profiles.default.widgets.omarchy-clock]).
+
+[options.format]
+type = "choice"
+title = "Clock format"
+default = "weekday-24h"
+choices = ["weekday-24h", "weekday-12h", "24h", "12h", "date-24h", "iso"]
+
+[options.font]
+type = "string"
+title = "Font family (or system)"
+default = "JetBrainsMono Nerd Font"
+maxLength = 64
+
+[options.size]
+type = "number"
+title = "Text size (points)"
+default = 12
+min = 8
+max = 20
+step = 1
+
+[options.weight]
+type = "choice"
+title = "Text weight"
+default = "regular"
+choices = ["light", "regular", "medium", "semibold", "bold"]
+
+[options.color]
+type = "string"
+title = "Text color (palette role or #RRGGBB)"
+default = "foreground"
+maxLength = 32

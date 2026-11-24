@@ -1,0 +1,927 @@
+# Omarchy-on-macOS key bindings: the single source of truth.
+#
+# Edit this file, then run:  omarchy-keys check  &&  omarchy-keys generate --out DIR
+# The generator writes karabiner.json, OmniWM [[hotkeys]] (settings.toml),
+# Hammerspoon generated/bindings.lua and KEYBINDINGS.md from it.
+#
+# SUPER = hold Caps Lock (Karabiner sends held right Cmd+Opt+Ctrl and sets the
+# variable omarchy_super). Tap Caps alone = Escape (nothing in Citrix Viewer).
+# CTRL / ALT inside a SUPER chord mean the physical LEFT Control / LEFT Option.
+#
+# Each [[bind]]:
+#   chord  = "SUPER+SHIFT+1"   modifiers SUPER SHIFT CTRL ALT, then one key:
+#            A-Z 0-9 RETURN SPACE TAB ESCAPE BACKSPACE FORWARDDELETE LEFT RIGHT UP DOWN
+#            MINUS EQUAL GRAVE COMMA PERIOD SLASH BACKSLASH BRACKETLEFT BRACKETRIGHT
+#            SEMICOLON APOSTROPHE HOME END PAGEUP PAGEDOWN PRINT
+#   desc   = "what it does"
+#   exactly one of:
+#     wm   = "<omniwmctl command args>"   e.g. "switch-workspace 1"
+#     wmx  = "<omarchy-wm verb args>"     e.g. "move-follow 1", "resize x +"
+#     hs   = "<hammerspoon action>"       (+ optional arg = "...")
+#     keys = "<chord to emit>"            e.g. "cmd+c", "ctrl+opt+shift+cmd+v"
+#   repeat = true                          (optional; key repeat while held. HS chords
+#                                           repeat through hs.hotkey; KB chords with
+#                                           repeat become KE: Karabiner emits a bridge
+#                                           chord Ctrl+Opt+Cmd(+Shift)+F16..F19 that
+#                                           Hammerspoon binds with repeat (not in Citrix
+#                                           Viewer, where they fire once). OmniWM-native
+#                                           chords always repeat)
+#   group  = "Windows"                     (optional; applies to this and the
+#                                           following binds until changed)
+#
+# Owners are decided by the generator, never by hand:
+#   OW  SUPER / SUPER+SHIFT chord whose wm command is one native OmniWM action
+#   HS  other SUPER / SUPER+SHIFT chords (Hammerspoon hs.hotkey)
+#   KB  any chord with CTRL or ALT added to SUPER, and PRINT (Karabiner shell_command)
+#   KE  keys = ... (Karabiner emits the chord), and repeating KB chords (bridge)
+# In Citrix Viewer every SUPER binding is served by Karabiner instead.
+# Unbound keys in every SUPER layer are swallowed. Never bind Ctrl+Alt+Delete.
+
+# ============================================================================
+# Navigation: launcher, menus, system
+# ============================================================================
+
+[[bind]]
+group = "Navigation"
+chord = "SUPER+SPACE"
+desc = "Omarchy menu (apps and commands)"
+hs = "menu"
+
+[[bind]]
+chord = "SUPER+ALT+SPACE"
+desc = "App grid (OmniWM app palette)"
+wm = "open-command-palette applications"
+
+[[bind]]
+chord = "SUPER+ESCAPE"
+desc = "System menu (lock, sleep, log out, restart, shut down)"
+hs = "menu-system"
+
+[[bind]]
+chord = "SUPER+K"
+desc = "Show key bindings"
+hs = "keybindings"
+
+# SKIPPED: SUPER+ALT+K  "Tmux key bindings" (tmux is not installed)
+# [[bind]]
+# chord = "SUPER+ALT+K"
+# desc = "Tmux key bindings"
+# hs = "keybindings"
+# arg = "tmux"
+
+[[bind]]
+chord = "SUPER+CTRL+K"
+desc = "Herdr key bindings"
+hs = "keybindings"
+arg = "herdr"
+
+[[bind]]
+chord = "SUPER+CTRL+L"
+desc = "Lock screen"
+keys = "ctrl+cmd+q"
+
+
+# ============================================================================
+# Windows
+# ============================================================================
+
+[[bind]]
+group = "Windows"
+chord = "SUPER+W"
+desc = "Close window"
+wm = "close-focused-window"
+
+[[bind]]
+chord = "SUPER+Q"
+desc = "Close window"
+wm = "close-focused-window"
+
+[[bind]]
+chord = "SUPER+J"
+desc = "Toggle split (dwindle)"
+wm = "toggle-split"
+
+[[bind]]
+chord = "SUPER+P"
+desc = "Pseudo-tile (approximation: cycle preset sizes)"
+wm = "cycle-size forward"
+
+[[bind]]
+chord = "SUPER+T"
+desc = "Toggle floating / tiling"
+wm = "toggle-focused-window-floating"
+
+[[bind]]
+chord = "SUPER+F"
+desc = "Full screen"
+wm = "toggle-fullscreen"
+
+[[bind]]
+chord = "SUPER+ALT+F"
+desc = "Full width (keeps the bar)"
+wmx = "fullwidth"
+
+[[bind]]
+chord = "SUPER+CTRL+F"
+desc = "macOS native full screen"
+wm = "toggle-native-fullscreen"
+
+[[bind]]
+chord = "SUPER+O"
+desc = "Pop window out (float, 1300x900, centred)"
+hs = "pop-out"
+
+[[bind]]
+chord = "SUPER+M"
+desc = "Minimize window"
+hs = "minimize"
+
+[[bind]]
+chord = "SUPER+L"
+desc = "Cycle workspace layout (dwindle <-> niri)"
+wm = "toggle-workspace-layout"
+
+[[bind]]
+chord = "SUPER+ALT+L"
+desc = "Cycle workspace layout (reverse)"
+wmx = "cycle-layout reverse"
+
+[[bind]]
+chord = "SUPER+LEFT"
+desc = "Focus window left"
+wm = "focus left"
+
+[[bind]]
+chord = "SUPER+RIGHT"
+desc = "Focus window right"
+wm = "focus right"
+
+[[bind]]
+chord = "SUPER+UP"
+desc = "Focus window up"
+wm = "focus up"
+
+[[bind]]
+chord = "SUPER+DOWN"
+desc = "Focus window down"
+wm = "focus down"
+
+[[bind]]
+chord = "SUPER+SHIFT+LEFT"
+desc = "Swap window left"
+wm = "move left"
+
+[[bind]]
+chord = "SUPER+SHIFT+RIGHT"
+desc = "Swap window right"
+wm = "move right"
+
+[[bind]]
+chord = "SUPER+SHIFT+UP"
+desc = "Swap window up"
+wm = "move up"
+
+[[bind]]
+chord = "SUPER+SHIFT+DOWN"
+desc = "Swap window down"
+wm = "move down"
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+LEFT"
+desc = "Move window to monitor left"
+wm = "move-to-monitor left"
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+RIGHT"
+desc = "Move window to monitor right"
+wm = "move-to-monitor right"
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+UP"
+desc = "Move window to monitor up"
+wm = "move-to-monitor up"
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+DOWN"
+desc = "Move window to monitor down"
+wm = "move-to-monitor down"
+
+[[bind]]
+chord = "CTRL+ALT+TAB"
+desc = "Focus next monitor"
+wm = "focus-monitor next"
+
+[[bind]]
+chord = "CTRL+ALT+SHIFT+TAB"
+desc = "Focus previous monitor"
+wm = "focus-monitor prev"
+
+# Resize. Layout-aware through omarchy-wm (dwindle: resize grow/shrink; niri: spans).
+[[bind]]
+chord = "SUPER+MINUS"
+desc = "Shrink window width"
+wmx = "resize x -"
+repeat = true
+
+[[bind]]
+chord = "SUPER+EQUAL"
+desc = "Grow window width"
+wmx = "resize x +"
+repeat = true
+
+[[bind]]
+chord = "SUPER+SHIFT+MINUS"
+desc = "Shrink window height"
+wmx = "resize y -"
+repeat = true
+
+[[bind]]
+chord = "SUPER+SHIFT+EQUAL"
+desc = "Grow window height"
+wmx = "resize y +"
+repeat = true
+
+[[bind]]
+chord = "SUPER+ALT+MINUS"
+desc = "Shrink window width (fine)"
+wmx = "resize x - fine"
+repeat = true
+
+[[bind]]
+chord = "SUPER+ALT+EQUAL"
+desc = "Grow window width (fine)"
+wmx = "resize x + fine"
+repeat = true
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+MINUS"
+desc = "Shrink window height (fine)"
+wmx = "resize y - fine"
+repeat = true
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+EQUAL"
+desc = "Grow window height (fine)"
+wmx = "resize y + fine"
+repeat = true
+
+[[bind]]
+chord = "SUPER+CTRL+MINUS"
+desc = "Shrink window width (coarse)"
+wmx = "resize x - coarse"
+repeat = true
+
+[[bind]]
+chord = "SUPER+CTRL+EQUAL"
+desc = "Grow window width (coarse)"
+wmx = "resize x + coarse"
+repeat = true
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+MINUS"
+desc = "Shrink window height (coarse)"
+wmx = "resize y - coarse"
+repeat = true
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+EQUAL"
+desc = "Grow window height (coarse)"
+wmx = "resize y + coarse"
+repeat = true
+
+# Groups. Approximated by OmniWM tabbed columns (niri workspaces only).
+[[bind]]
+chord = "SUPER+G"
+desc = "Toggle window grouping (tabbed column, niri)"
+wm = "toggle-column-tabbed"
+
+[[bind]]
+chord = "SUPER+ALT+G"
+desc = "Move window out of group (niri)"
+wm = "expel-window-from-column"
+
+[[bind]]
+chord = "SUPER+ALT+LEFT"
+desc = "Move window into group on the left (niri)"
+wm = "consume-or-expel-window-left"
+
+[[bind]]
+chord = "SUPER+ALT+RIGHT"
+desc = "Move window into group on the right (niri)"
+wm = "consume-or-expel-window-right"
+
+[[bind]]
+chord = "SUPER+ALT+TAB"
+desc = "Next window in group"
+wm = "focus-window down-or-top"
+
+[[bind]]
+chord = "SUPER+ALT+SHIFT+TAB"
+desc = "Previous window in group"
+wm = "focus-window up-or-bottom"
+
+[[bind]]
+chord = "SUPER+CTRL+LEFT"
+desc = "Previous window in group"
+wm = "focus-window up-or-bottom"
+
+[[bind]]
+chord = "SUPER+CTRL+RIGHT"
+desc = "Next window in group"
+wm = "focus-window down-or-top"
+
+[[bind]]
+chord = "SUPER+ALT+1"
+desc = "Jump to group window 1 (niri)"
+wm = "focus-window-in-column 1"
+
+[[bind]]
+chord = "SUPER+ALT+2"
+desc = "Jump to group window 2 (niri)"
+wm = "focus-window-in-column 2"
+
+[[bind]]
+chord = "SUPER+ALT+3"
+desc = "Jump to group window 3 (niri)"
+wm = "focus-window-in-column 3"
+
+[[bind]]
+chord = "SUPER+ALT+4"
+desc = "Jump to group window 4 (niri)"
+wm = "focus-window-in-column 4"
+
+[[bind]]
+chord = "SUPER+ALT+5"
+desc = "Jump to group window 5 (niri)"
+wm = "focus-window-in-column 5"
+
+[[bind]]
+chord = "SUPER+CTRL+ALT+O"
+desc = "Overview of all windows (extra)"
+wm = "toggle-overview"
+
+
+# ============================================================================
+# Workspaces (absolute numbering: SUPER+N is workspace N wherever it lives)
+# ============================================================================
+
+[[bind]]
+group = "Workspaces"
+chord = "SUPER+1"
+desc = "Switch to workspace 1"
+wm = "switch-workspace 1"
+
+[[bind]]
+chord = "SUPER+2"
+desc = "Switch to workspace 2"
+wm = "switch-workspace 2"
+
+[[bind]]
+chord = "SUPER+3"
+desc = "Switch to workspace 3"
+wm = "switch-workspace 3"
+
+[[bind]]
+chord = "SUPER+4"
+desc = "Switch to workspace 4"
+wm = "switch-workspace 4"
+
+[[bind]]
+chord = "SUPER+5"
+desc = "Switch to workspace 5"
+wm = "switch-workspace 5"
+
+[[bind]]
+chord = "SUPER+6"
+desc = "Switch to workspace 6"
+wm = "switch-workspace 6"
+
+[[bind]]
+chord = "SUPER+7"
+desc = "Switch to workspace 7"
+wm = "switch-workspace 7"
+
+[[bind]]
+chord = "SUPER+8"
+desc = "Switch to workspace 8"
+wm = "switch-workspace 8"
+
+[[bind]]
+chord = "SUPER+9"
+desc = "Switch to workspace 9"
+wm = "switch-workspace 9"
+
+[[bind]]
+chord = "SUPER+SHIFT+1"
+desc = "Move window to workspace 1 and follow"
+wmx = "move-follow 1"
+
+[[bind]]
+chord = "SUPER+SHIFT+2"
+desc = "Move window to workspace 2 and follow"
+wmx = "move-follow 2"
+
+[[bind]]
+chord = "SUPER+SHIFT+3"
+desc = "Move window to workspace 3 and follow"
+wmx = "move-follow 3"
+
+[[bind]]
+chord = "SUPER+SHIFT+4"
+desc = "Move window to workspace 4 and follow"
+wmx = "move-follow 4"
+
+[[bind]]
+chord = "SUPER+SHIFT+5"
+desc = "Move window to workspace 5 and follow"
+wmx = "move-follow 5"
+
+[[bind]]
+chord = "SUPER+SHIFT+6"
+desc = "Move window to workspace 6 and follow"
+wmx = "move-follow 6"
+
+[[bind]]
+chord = "SUPER+SHIFT+7"
+desc = "Move window to workspace 7 and follow"
+wmx = "move-follow 7"
+
+[[bind]]
+chord = "SUPER+SHIFT+8"
+desc = "Move window to workspace 8 and follow"
+wmx = "move-follow 8"
+
+[[bind]]
+chord = "SUPER+SHIFT+9"
+desc = "Move window to workspace 9 and follow"
+wmx = "move-follow 9"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+1"
+desc = "Move window to workspace 1 silently"
+wmx = "move-silent 1"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+2"
+desc = "Move window to workspace 2 silently"
+wmx = "move-silent 2"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+3"
+desc = "Move window to workspace 3 silently"
+wmx = "move-silent 3"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+4"
+desc = "Move window to workspace 4 silently"
+wmx = "move-silent 4"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+5"
+desc = "Move window to workspace 5 silently"
+wmx = "move-silent 5"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+6"
+desc = "Move window to workspace 6 silently"
+wmx = "move-silent 6"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+7"
+desc = "Move window to workspace 7 silently"
+wmx = "move-silent 7"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+8"
+desc = "Move window to workspace 8 silently"
+wmx = "move-silent 8"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+9"
+desc = "Move window to workspace 9 silently"
+wmx = "move-silent 9"
+
+# No workspace 10: SUPER+0 is intentionally unbound.
+
+[[bind]]
+chord = "SUPER+TAB"
+desc = "Next workspace"
+wm = "switch-workspace next"
+
+[[bind]]
+chord = "SUPER+SHIFT+TAB"
+desc = "Previous workspace"
+wm = "switch-workspace prev"
+
+[[bind]]
+chord = "SUPER+CTRL+TAB"
+desc = "Former workspace"
+wm = "switch-workspace back-and-forth"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+LEFT"
+desc = "Move workspace to monitor left"
+wmx = "ws-to-monitor left"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+RIGHT"
+desc = "Move workspace to monitor right"
+wmx = "ws-to-monitor right"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+UP"
+desc = "Move workspace to monitor up"
+wmx = "ws-to-monitor up"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+DOWN"
+desc = "Move workspace to monitor down"
+wmx = "ws-to-monitor down"
+
+[[bind]]
+chord = "SUPER+S"
+desc = "Toggle scratchpad"
+wm = "scratchpad toggle 1"
+
+[[bind]]
+chord = "SUPER+ALT+S"
+desc = "Move window to scratchpad"
+wm = "scratchpad assign 1"
+
+[[bind]]
+chord = "SUPER+GRAVE"
+desc = "Toggle Quake terminal"
+wm = "toggle-quake-terminal"
+
+[[bind]]
+chord = "SUPER+SHIFT+GRAVE"
+desc = "Send window to scratchpad 2 (approximation of 'move to Quake')"
+wm = "scratchpad assign 2"
+
+
+# ============================================================================
+# Apps
+# ============================================================================
+
+[[bind]]
+group = "Apps"
+chord = "SUPER+RETURN"
+desc = "Terminal (new Ghostty window)"
+hs = "terminal"
+
+[[bind]]
+chord = "SUPER+SHIFT+RETURN"
+desc = "Browser (Google Chrome)"
+hs = "browser"
+
+[[bind]]
+chord = "SUPER+SHIFT+B"
+desc = "Browser (Google Chrome)"
+hs = "browser"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+B"
+desc = "Browser (private window)"
+hs = "browser-private"
+
+[[bind]]
+chord = "SUPER+SHIFT+F"
+desc = "File manager (Finder)"
+hs = "finder"
+
+[[bind]]
+chord = "SUPER+SHIFT+N"
+desc = "Editor (Neovim in Ghostty)"
+hs = "tui"
+arg = "nvim"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+N"
+desc = "Visual Studio Code"
+hs = "app"
+arg = "Visual Studio Code"
+
+[[bind]]
+chord = "SUPER+SHIFT+T"
+desc = "Activity (btop)"
+hs = "tui"
+arg = "btop"
+
+[[bind]]
+chord = "SUPER+SHIFT+D"
+desc = "Lazygit (Omarchy: lazydocker, not installed)"
+hs = "tui"
+arg = "lazygit"
+
+# SKIPPED: SUPER+ALT+RETURN  "Tmux" (tmux is not installed)
+# [[bind]]
+# chord = "SUPER+ALT+RETURN"
+# desc = "Tmux"
+# hs = "tui"
+# arg = "tmux"
+
+[[bind]]
+chord = "SUPER+CTRL+RETURN"
+desc = "Herdr"
+hs = "app"
+arg = "dev.herdr.app"
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+A"
+desc = "Pick an AI agent"
+hs = "agents"
+
+[[bind]]
+chord = "SUPER+SHIFT+A"
+desc = "AI (Claude)"
+hs = "app"
+arg = "Claude"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+A"
+desc = "AI (ChatGPT)"
+hs = "app"
+arg = "ChatGPT"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+X"
+desc = "AI (Grok Bot)"
+hs = "app"
+arg = "Grok Bot"
+
+[[bind]]
+chord = "SUPER+SHIFT+M"
+desc = "Music (Spotify)"
+hs = "app"
+arg = "Spotify"
+
+# SKIPPED: SUPER+SHIFT+ALT+M  "cliamp" (Linux-only music TUI)
+
+[[bind]]
+chord = "SUPER+SHIFT+SLASH"
+desc = "Password manager (Bitwarden)"
+hs = "app"
+arg = "Bitwarden"
+
+[[bind]]
+chord = "SUPER+SHIFT+O"
+desc = "Notes (Notion)"
+hs = "app"
+arg = "Notion"
+
+[[bind]]
+chord = "SUPER+SHIFT+G"
+desc = "Messages"
+hs = "app"
+arg = "Messages"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+G"
+desc = "Telegram"
+hs = "app"
+arg = "Telegram"
+
+# SKIPPED: SUPER+SHIFT+CTRL+G  "Google Messages" (Apple Messages is on SUPER+SHIFT+G)
+
+[[bind]]
+chord = "SUPER+SHIFT+S"
+desc = "Slack (Omarchy: Google Maps)"
+hs = "app"
+arg = "Slack"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+D"
+desc = "Discord"
+hs = "app"
+arg = "Discord"
+
+[[bind]]
+chord = "SUPER+SHIFT+E"
+desc = "Email (Mail)"
+hs = "app"
+arg = "Mail"
+
+# SKIPPED: SUPER+SHIFT+ALT+E  "New email" (HEY compose; no Mail equivalent wired)
+
+[[bind]]
+chord = "SUPER+SHIFT+C"
+desc = "Calendar"
+hs = "app"
+arg = "Calendar"
+
+[[bind]]
+chord = "SUPER+SHIFT+P"
+desc = "Photos"
+hs = "app"
+arg = "Photos"
+
+[[bind]]
+chord = "SUPER+SHIFT+Q"
+desc = "Calculator"
+hs = "app"
+arg = "Calculator"
+
+[[bind]]
+chord = "SUPER+SHIFT+Y"
+desc = "YouTube (web app)"
+hs = "webapp"
+arg = "https://youtube.com/"
+
+[[bind]]
+chord = "SUPER+SHIFT+X"
+desc = "X (web app)"
+hs = "webapp"
+arg = "https://x.com/"
+
+# SKIPPED: SUPER+SHIFT+W  "Omawrite" (Linux-only)
+
+# SKIPPED: SUPER+SHIFT+ALT+F  "File manager in terminal cwd" (not portable)
+
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+[[bind]]
+group = "Utilities"
+chord = "SUPER+C"
+desc = "Copy"
+keys = "cmd+c"
+
+[[bind]]
+chord = "SUPER+V"
+desc = "Paste"
+keys = "cmd+v"
+
+[[bind]]
+chord = "SUPER+X"
+desc = "Cut"
+keys = "cmd+x"
+
+[[bind]]
+chord = "SUPER+A"
+desc = "Select all"
+keys = "cmd+a"
+
+[[bind]]
+chord = "SUPER+CTRL+V"
+desc = "Clipboard history (Maccy)"
+keys = "cmd+shift+c"  # Maccy default popup shortcut
+
+[[bind]]
+chord = "SUPER+CTRL+E"
+desc = "Emoji picker"
+keys = "ctrl+cmd+space"
+
+# SKIPPED: SUPER+I  "Next input source" (only the U.S. layout is enabled and the Ctrl+Space
+#          input-source shortcuts 60/61 are disabled, so ctrl+space would only leak into apps)
+
+[[bind]]
+chord = "SUPER+CTRL+C"
+desc = "Capture menu"
+hs = "menu-capture"
+
+[[bind]]
+chord = "SUPER+CTRL+ALT+C"
+desc = "Screenshot a region (save, clipboard, edit)"
+hs = "screenshot-region"
+
+[[bind]]
+chord = "PRINT"
+desc = "Screenshot a region"
+hs = "screenshot-region"
+
+[[bind]]
+chord = "ALT+PRINT"
+desc = "Screen recording"
+hs = "screenrecord"
+
+[[bind]]
+chord = "SUPER+PRINT"
+desc = "Color picker"
+hs = "color-picker"
+
+[[bind]]
+chord = "SUPER+CTRL+O"
+desc = "Toggle menu"
+hs = "menu-toggle"
+
+[[bind]]
+chord = "SUPER+CTRL+P"
+desc = "Power / system menu"
+hs = "menu-system"
+
+# SKIPPED: SUPER+CTRL+H  "Hardware menu" (no macOS equivalent action yet)
+
+# Omarchy's panels map to System Settings panes (Hammerspoon action "settings", x = pane id).
+[[bind]]
+chord = "SUPER+CTRL+A"
+desc = "Audio settings"
+hs = "settings"
+arg = "com.apple.Sound-Settings.extension"
+
+[[bind]]
+chord = "SUPER+CTRL+B"
+desc = "Bluetooth settings"
+hs = "settings"
+arg = "com.apple.BluetoothSettings"
+
+[[bind]]
+chord = "SUPER+CTRL+N"
+desc = "Wi-Fi settings"
+hs = "settings"
+arg = "com.apple.wifi-settings-extension"
+
+[[bind]]
+chord = "SUPER+CTRL+D"
+desc = "Display settings"
+hs = "settings"
+arg = "com.apple.Displays-Settings.extension"
+
+[[bind]]
+chord = "SUPER+CTRL+ALT+D"
+desc = "Calendar"
+hs = "app"
+arg = "Calendar"
+
+[[bind]]
+chord = "SUPER+CTRL+I"
+desc = "Toggle stay awake"
+hs = "stay-awake"
+
+[[bind]]
+chord = "SUPER+CTRL+ALT+T"
+desc = "Show the time"
+hs = "show-time"
+
+[[bind]]
+chord = "SUPER+CTRL+ALT+B"
+desc = "Show battery"
+hs = "show-battery"
+
+[[bind]]
+chord = "SUPER+COMMA"
+desc = "Notification Center"
+hs = "notification-center"
+
+[[bind]]
+chord = "SUPER+SHIFT+ALT+COMMA"
+desc = "Notification history (Notification Center)"
+hs = "notification-center"
+
+# SKIPPED: SUPER+SHIFT+COMMA / SUPER+ALT+COMMA / SUPER+CTRL+COMMA  "Dismiss / keyboard-control notifications" (no macOS API)
+
+# SKIPPED: SUPER+CTRL+ALT+COMMA  "Do Not Disturb" (dropped)
+
+# SKIPPED: SUPER+CTRL+R / SUPER+CTRL+ALT+R / SUPER+SHIFT+CTRL+R  "Reminders" (dropped)
+
+# SKIPPED: SUPER+CTRL+S  "Share" (dropped)
+
+# SKIPPED: SUPER+CTRL+Z / SUPER+CTRL+ALT+Z  "Zoom" (dropped; needs Accessibility zoom shortcuts)
+
+# SKIPPED: CTRL+ALT+DELETE  "Close all windows" (NEVER bind: Citrix/Windows needs it)
+
+
+# ============================================================================
+# Style
+# ============================================================================
+
+[[bind]]
+group = "Style"
+chord = "SUPER+SHIFT+SPACE"
+desc = "Toggle top bar"
+wm = "toggle-workspace-bar"
+
+[[bind]]
+chord = "SUPER+CTRL+SPACE"
+desc = "Pick a background"
+hs = "menu-background"
+
+[[bind]]
+chord = "SUPER+CTRL+W"
+desc = "Pick a background"
+hs = "menu-background"
+
+[[bind]]
+chord = "SUPER+CTRL+T"
+desc = "Pick a theme"
+hs = "menu-theme"
+
+[[bind]]
+chord = "SUPER+SHIFT+CTRL+SPACE"
+desc = "Pick a theme"
+hs = "menu-theme"
+
+[[bind]]
+chord = "SUPER+BACKSPACE"
+desc = "Toggle window transparency (Ghostty)"
+hs = "toggle-transparency"
+
+[[bind]]
+chord = "SUPER+SHIFT+BACKSPACE"
+desc = "Toggle window gaps"
+hs = "toggle-gaps"
+
+# SKIPPED: SUPER+CTRL+ALT+F  "Full-screen desktop (no bar, no gaps)" (no single action; use SUPER+SHIFT+SPACE + SUPER+SHIFT+BACKSPACE)
+
+# SKIPPED: SUPER+CTRL+BACKSPACE  "Single-window square aspect" (not possible in OmniWM)
