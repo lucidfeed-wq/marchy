@@ -15,7 +15,7 @@ center = ["omarchy-clock", "omarchy-elsewhen", "omarchy-weather"]
 # into this bar: Hammerspoon reads them via Accessibility and clicking one opens
 # the real app menu. The macOS menu bar itself is auto-hidden by this full-width
 # bar; app-menu (after the workspaces) keeps File/Edit menus reachable.
-trailing = ["omarchy-tray", "omarchy-agents", "omarchy-bluetooth", "omarchy-wifi", "omarchy-audio", "omarchy-monitor", "omarchy-power"]
+trailing = ["omarchy-tray", "omarchy-media", "omarchy-agents", "omarchy-tailscale", "omarchy-bluetooth", "omarchy-wifi", "omarchy-audio", "omarchy-monitor", "omarchy-power"]
 
 [profiles.default.workspaceBar]
 position = "overlappingMenuBar"
