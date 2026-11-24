@@ -1,0 +1,10 @@
+{
+  "id": "battery",
+  "status": "partial",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "battery.check"
+  ],
+  "hotkeys": []
+}

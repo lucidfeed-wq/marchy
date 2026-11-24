@@ -1,0 +1,17 @@
+{
+  "id": "idle",
+  "status": "ported",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "idle.toggle",
+    "idle.enable",
+    "idle.disable",
+    "idle.status",
+    "idle.screensaver",
+    "idle.screensaver-toggle"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + I", "action": "idle.toggle" }
+  ]
+}
