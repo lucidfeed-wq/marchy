@@ -765,8 +765,8 @@ keys = "cmd+a"
 
 [[bind]]
 chord = "SUPER+CTRL+V"
-desc = "Clipboard history (Maccy)"
-keys = "cmd+shift+c"  # Maccy default popup shortcut
+desc = "Clipboard history (Omarchy)"
+hs = "clipboard.toggle"  # Maccy stays on its own Cmd+Shift+C
 
 [[bind]]
 chord = "SUPER+CTRL+E"
@@ -816,9 +816,8 @@ hs = "menu-system"
 # Omarchy's panels map to System Settings panes (Hammerspoon action "settings", x = pane id).
 [[bind]]
 chord = "SUPER+CTRL+A"
-desc = "Audio settings"
-hs = "settings"
-arg = "com.apple.Sound-Settings.extension"
+desc = "Audio panel (Omarchy)"
+hs = "audio.toggle"
 
 [[bind]]
 chord = "SUPER+CTRL+B"
