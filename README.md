@@ -12,7 +12,9 @@ Mac versions with the AI account you already have.
 ## Install
 
 ```sh
-brew install --cask lucidfeed-wq/marchy/marchy
+brew tap lucidfeed-wq/marchy
+brew trust lucidfeed-wq/marchy      # Homebrew asks you to trust third-party taps
+brew install --cask marchy
 ```
 
 or download `Marchy-<version>.dmg` from [Releases](../../releases) and drag Marchy to Applications.
