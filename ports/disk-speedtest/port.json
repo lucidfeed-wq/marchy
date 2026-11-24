@@ -1,0 +1,13 @@
+{
+  "id": "disk-speedtest",
+  "status": "ported",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "disk-speedtest.open",
+    "disk-speedtest.toggle",
+    "disk-speedtest.close",
+    "disk-speedtest.run"
+  ],
+  "hotkeys": []
+}

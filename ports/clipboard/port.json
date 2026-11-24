@@ -1,0 +1,10 @@
+{
+  "id": "clipboard",
+  "status": "partial",
+  "bar": "none",
+  "requires": [],
+  "actions": ["clipboard.toggle", "clipboard.open", "clipboard.close", "clipboard.clear"],
+  "hotkeys": [
+    { "chord": "SUPER CTRL V", "action": "clipboard.toggle" }
+  ]
+}

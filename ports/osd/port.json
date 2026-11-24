@@ -1,0 +1,24 @@
+{
+  "id": "osd",
+  "status": "ported",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "osd.show",
+    "osd.close",
+    "osd.volume-up",
+    "osd.volume-down",
+    "osd.volume-mute",
+    "osd.mic-mute",
+    "osd.brightness-up",
+    "osd.brightness-down"
+  ],
+  "hotkeys": [
+    { "chord": "XF86AudioRaiseVolume", "action": "osd.volume-up" },
+    { "chord": "XF86AudioLowerVolume", "action": "osd.volume-down" },
+    { "chord": "XF86AudioMute", "action": "osd.volume-mute" },
+    { "chord": "XF86AudioMicMute", "action": "osd.mic-mute" },
+    { "chord": "XF86MonBrightnessUp", "action": "osd.brightness-up" },
+    { "chord": "XF86MonBrightnessDown", "action": "osd.brightness-down" }
+  ]
+}
