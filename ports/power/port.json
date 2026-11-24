@@ -1,0 +1,14 @@
+{
+  "id": "power",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": [],
+  "actions": [
+    "power.toggle",
+    "power.toggle-percentage",
+    "power.refresh"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + P", "action": "power.toggle" }
+  ]
+}

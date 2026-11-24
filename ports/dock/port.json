@@ -1,0 +1,17 @@
+{
+  "id": "dock",
+  "status": "partial",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "dock.apps",
+    "dock.toggle",
+    "dock.show",
+    "dock.hide",
+    "dock.position",
+    "dock.autohide"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + ALT + SPACE", "action": "dock.apps" }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "nightlight",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": ["nightlight (brew install smudge/smudge/nightlight; optional: without it the actions open Displays settings)"],
+  "actions": [
+    "nightlight.toggle",
+    "nightlight.enable",
+    "nightlight.disable",
+    "nightlight.refresh",
+    "nightlight.status",
+    "nightlight.settings"
+  ],
+  "hotkeys": []
+}

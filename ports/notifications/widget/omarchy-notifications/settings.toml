@@ -1,0 +1,7 @@
+# Options for the omarchy-notifications bar widget (values arrive in ctx.data.settings;
+# override them in shell.toml under [profiles.default.widgets.omarchy-notifications]).
+
+[options.alwaysShow]
+type = "boolean"
+title = "Show the indicator (dimmed) while notifications are allowed, so a click can silence them"
+default = true

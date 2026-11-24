@@ -1,0 +1,15 @@
+{
+  "id": "agents",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": [],
+  "actions": [
+    "agents.refresh",
+    "agents.toggle",
+    "agents.launch",
+    "agents.signin"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + SHIFT + CTRL + A", "action": "agents.launch" }
+  ]
+}

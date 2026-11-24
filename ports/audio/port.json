@@ -1,0 +1,14 @@
+{
+  "id": "audio",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": [],
+  "actions": [
+    "audio.input",
+    "audio.toggle",
+    "audio.refresh"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + A", "action": "audio.toggle" }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "monitor",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": [
+    "optional: betterdisplaycli (brew install waydabber/betterdisplay/betterdisplaycli) for external brightness and turning displays off"
+  ],
+  "actions": [
+    "monitor.refresh",
+    "monitor.open",
+    "monitor.scale",
+    "monitor.scale-up",
+    "monitor.scale-down",
+    "monitor.display",
+    "monitor.toggle-internal",
+    "monitor.mirror-internal",
+    "monitor.brightness",
+    "monitor.osd"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + D", "action": "monitor.open" },
+    { "chord": "SUPER + SLASH", "action": "monitor.scale-up" },
+    { "chord": "SUPER + ALT + SLASH", "action": "monitor.scale-down" },
+    { "chord": "SUPER + CTRL + Delete", "action": "monitor.toggle-internal" },
+    { "chord": "SUPER + CTRL + ALT + Delete", "action": "monitor.mirror-internal" }
+  ]
+}

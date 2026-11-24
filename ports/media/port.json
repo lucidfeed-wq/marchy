@@ -1,0 +1,19 @@
+{
+  "id": "media",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": [],
+  "actions": [
+    "media.play-pause",
+    "media.next",
+    "media.previous"
+  ],
+  "hotkeys": [
+    { "chord": "XF86AudioPlay", "action": "media.play-pause" },
+    { "chord": "XF86AudioPause", "action": "media.play-pause" },
+    { "chord": "XF86AudioNext", "action": "media.next" },
+    { "chord": "ALT + XF86AudioPlay", "action": "media.next" },
+    { "chord": "XF86AudioPrev", "action": "media.previous" },
+    { "chord": "ALT + SHIFT + XF86AudioPlay", "action": "media.previous" }
+  ]
+}

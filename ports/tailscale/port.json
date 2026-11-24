@@ -1,0 +1,18 @@
+{
+  "id": "tailscale",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": ["Tailscale.app in /Applications (its bundled CLI: Contents/MacOS/Tailscale)"],
+  "actions": [
+    "tailscale.panel",
+    "tailscale.toggle",
+    "tailscale.up",
+    "tailscale.down",
+    "tailscale.refresh",
+    "tailscale.switch",
+    "tailscale.exit-node",
+    "tailscale.copy",
+    "tailscale.send"
+  ],
+  "hotkeys": []
+}

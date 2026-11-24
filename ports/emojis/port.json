@@ -1,0 +1,14 @@
+{
+  "id": "emojis",
+  "status": "ported",
+  "bar": "none",
+  "requires": [],
+  "actions": [
+    "emojis.open",
+    "emojis.toggle",
+    "emojis.close"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + E", "action": "emojis.toggle" }
+  ]
+}

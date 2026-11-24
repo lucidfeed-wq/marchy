@@ -1,0 +1,16 @@
+{
+  "id": "weather",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": [
+    "OmniWM [weather] city (or latitude/longitude) in ~/.config/omniwm/shell/shell.toml",
+    "OmniWM Settings > Network & Permissions > Built-in Services > Weather on (default)"
+  ],
+  "actions": [
+    "weather.toggle",
+    "weather.status"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + CTRL + ALT + W", "action": "weather.toggle" }
+  ]
+}

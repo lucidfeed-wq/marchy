@@ -1,0 +1,30 @@
+{
+  "id": "notifications",
+  "status": "partial",
+  "bar": "trailing",
+  "requires": [],
+  "actions": [
+    "notifications.act",
+    "notifications.dismiss-one",
+    "notifications.dismiss-all",
+    "notifications.invoke-last",
+    "notifications.invoke",
+    "notifications.keyboard",
+    "notifications.history",
+    "notifications.clear-history",
+    "notifications.expand",
+    "notifications.toggle-dnd",
+    "notifications.dnd",
+    "notifications.center",
+    "notifications.focus-settings",
+    "notifications.test"
+  ],
+  "hotkeys": [
+    { "chord": "SUPER + comma", "action": "notifications.act" },
+    { "chord": "SUPER + SHIFT + comma", "action": "notifications.dismiss-all" },
+    { "chord": "SUPER + CTRL + comma", "action": "notifications.keyboard" },
+    { "chord": "SUPER + ALT + comma", "action": "notifications.dismiss-one" },
+    { "chord": "SUPER + SHIFT + ALT + comma", "action": "notifications.history" },
+    { "chord": "SUPER + CTRL + ALT + comma", "action": "notifications.toggle-dnd" }
+  ]
+}
