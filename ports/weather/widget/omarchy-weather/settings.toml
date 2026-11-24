@@ -1,0 +1,15 @@
+# Options for the omarchy-weather bar widget (values arrive in ctx.data.settings;
+# override in shell.toml under [profiles.default.widgets.omarchy-weather]).
+#
+# The forecast itself (location, refresh interval, the unit OmniWM fetches in) comes
+# from OmniWM's own [weather] table in shell.toml, e.g.
+#   [weather]
+#   city = "Toronto"        # or latitude = 43.65, longitude = -79.38
+#   units = "celsius"       # or "fahrenheit"
+#   refresh = 15            # minutes
+
+[options.unit]
+type = "choice"
+title = "Units (auto = OmniWM's [weather] units)"
+default = "auto"
+choices = ["auto", "metric", "imperial"]
