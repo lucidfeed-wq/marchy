@@ -1,0 +1,7 @@
+# Options for the omarchy-monitor bar widget (values arrive in ctx.data.settings;
+# override them in shell.toml under [profiles.default.widgets.omarchy-monitor]).
+
+[options.osd]
+type = "boolean"
+title = "Show the brightness OSD when scrolling on the item (needs the osd port)"
+default = true
