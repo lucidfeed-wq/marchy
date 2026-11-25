@@ -1,6 +1,8 @@
 -- Keeping the setup healthy:
 --   * relaunch OmniWM if it quits (checked 5 s later; at most 3 times in
---     10 minutes; `touch ~/.local/state/omarchy-mac/omniwm-no-restart` to stop)
+--     10 minutes; `touch ~/.local/state/omarchy-mac/omniwm-no-restart` to stop).
+--     Two detectors: the app watcher, and a 10 s poll, because the watcher's
+--     terminated event never arrived when OmniWM crashed on a dock unplug (2026-11-25).
 --   * a Secure Input watcher that logs every change and toasts once when it
 --     turns on, naming the process that holds it
 --   * the `diag` action, writing ~/.local/state/omarchy-mac/diag.json
@@ -24,9 +26,13 @@ local function omniwmRunning()
 end
 M.omniwmRunning = omniwmRunning
 
-local function scheduleRelaunch()
-  log.w("health: OmniWM terminated")
+local pending = false
+local function scheduleRelaunch(how)
+  if pending then return end
+  pending = true
+  log.w("health: OmniWM terminated (%s)", how or "watcher")
   hs.timer.doAfter(RESTART_DELAY, function()
+    pending = false
     if omniwmRunning() then return end
     if u.exists(u.STATE .. "/omniwm-no-restart") then
       log.i("health: omniwm-no-restart present; not relaunching")
@@ -89,6 +95,15 @@ function M.start()
     if name == "OmniWM" or bid == u.OMNIWM_BUNDLE then scheduleRelaunch() end
   end)
   M.appWatcher:start()
+
+  -- Backstop poll: only acts on a running -> gone transition, so quitting OmniWM before
+  -- Hammerspoon starts (or keeping it off) is left alone.
+  M.omniwmWasRunning = omniwmRunning()
+  M.omniwmPoll = hs.timer.doEvery(10, function()
+    local now = omniwmRunning()
+    if M.omniwmWasRunning and not now then scheduleRelaunch("poll") end
+    M.omniwmWasRunning = now
+  end)
 
   M.secureTimer = hs.timer.doEvery(2, function()
     local ok, err = pcall(checkSecureInput)
