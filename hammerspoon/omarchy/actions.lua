@@ -150,6 +150,7 @@ def("menu-capture", function() menu().open("capture") end, "Capture menu")
 def("menu-toggle", function() menu().open("toggle") end, "Toggle menu")
 def("menu-setup", function() menu().open("setup") end, "Setup menu")
 def("keybindings", function(x) menu().keybindings(x) end, "Keybindings viewer (x = herdr, or a search filter)")
+def("app-menu", function() require("omarchy.appmenu").toggle() end, "Search the frontmost app's menu commands")
 
 ------------------------------------------------------------------ launching
 

@@ -482,6 +482,12 @@ function M.isOpen()
   return (chooser and chooser:isVisible()) or (kbChooser and kbChooser:isVisible()) or false
 end
 
+-- Theme a chooser like the Omarchy menu and return where to show it (used by appmenu.lua).
+function M.style(c, maxWidth)
+  applyColors(c)
+  return place(c, maxWidth or 720)
+end
+
 local function prettyChord(chord)
   local parts = {}
   for p in tostring(chord or ""):gmatch("[^+]+") do

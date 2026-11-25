@@ -65,6 +65,7 @@ The ready-made ports under **Plugins > Included** need no AI.
 | Omarchy keybindings | 150+ bindings from **one file**, `bindings.toml`, generated into Karabiner, OmniWM and Hammerspoon |
 | Omarchy bar | OmniShell bar: logo, workspaces, clock, weather, media, menu-bar tray mirrored into the bar, interactive Wi-Fi/Bluetooth/audio panels |
 | `Super+Space` menu, `Super+K` keybindings | Omarchy menu with type-to-search; searchable keybinding list |
+| (macOS menu bar) | Hidden behind the Omarchy bar; **`Super+/`** searches every menu command of the app in front (type "csv" → File › Export To › CSV…) |
 | Theme and background pickers | Image-grid pickers; one switch restyles Ghostty, Neovim, btop, the bar, borders, wallpaper and light/dark mode |
 | Omarchy shell plugins | 20 ready-made ports + the converter for any other |
 

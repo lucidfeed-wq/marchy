@@ -120,7 +120,7 @@ HS_ACTIONS = {
     "color-picker", "stay-awake", "show-time", "show-battery", "notification-center", "agents",
     "lock", "next-background", "wm", "diag", "reload",
     # extensions defined by the Hammerspoon component (omarchy/actions.lua):
-    "settings",
+    "settings", "app-menu",
 }
 HS_ARG_REQUIRED = {"tui", "app", "webapp", "wm", "settings"}
 
@@ -138,7 +138,7 @@ INTENDED_SETTINGS = [
     # disables hover edge-scrolling (user, 2026-11-23).
     ("focus.followsMouseOnlyFullyVisible", True),
     ("mouseWarp.enabled", True),
-    ("workspaces[name=1].layoutType", "dwindle"),
+    # Workspace layouts are the user's choice (Super+L); layoutwatch.lua keeps them. Never force one here.
     ("windowSwitcher.optionTab", "disabled"),
     # Global bar values aligned with omniwm-shell/shell.toml (which wins anyway).
     # Single full-width Omarchy bar over the (auto-hidden) macOS menu bar; menu-bar extras are

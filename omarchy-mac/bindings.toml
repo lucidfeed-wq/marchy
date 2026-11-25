@@ -62,6 +62,12 @@ chord = "SUPER+K"
 desc = "Show key bindings"
 hs = "keybindings"
 
+# macOS addition: the menu bar is hidden behind the Omarchy bar, so search it instead.
+[[bind]]
+chord = "SUPER+SLASH"
+desc = "Search the current app's menus (File, Edit, Export...)"
+hs = "app-menu"
+
 # SKIPPED: SUPER+ALT+K  "Tmux key bindings" (tmux is not installed)
 # [[bind]]
 # chord = "SUPER+ALT+K"
